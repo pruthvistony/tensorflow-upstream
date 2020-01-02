@@ -3777,6 +3777,30 @@ cuda_py_test(
 )
 
 cuda_py_test(
+    name = "gpu_fusion_ops_test",
+    size = "small",
+    srcs = ["gpu_fusion_ops_test.py"],
+    additional_deps = [
+        "//third_party/py/numpy",
+        "//tensorflow/core:protos_all_py",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:client",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python:errors",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:framework_test_lib",
+        "//tensorflow/python:nn",
+        "//tensorflow/python:nn_grad",
+        "//tensorflow/python:nn_ops",
+        "//tensorflow/python:gradients",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
+        "//tensorflow/python:random_ops",
+        "//tensorflow/python:variables",
+    ],
+)
+
+cuda_py_test(
     name = "critical_section_test",
     size = "medium",
     srcs = ["critical_section_test.py"],
