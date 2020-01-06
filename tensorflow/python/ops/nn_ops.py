@@ -44,6 +44,8 @@ from tensorflow.python.ops import random_ops
 from tensorflow.python.ops.gen_nn_ops import *
 # pylint: enable=wildcard-import
 from tensorflow.python.platform import device_context
+from tensorflow.python.platform import build_info
+from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import deprecation
 from tensorflow.python.util.compat import collections_abc
 from tensorflow.python.util.deprecation import deprecated_args
@@ -3057,7 +3059,7 @@ def softmax(logits, axis=None, name=None, dim=None):
       Tensor.
     RuntimeError: If a registered conversion function returns an invalid
       value.
-      
+
   """
   axis = deprecation.deprecated_argument_lookup("axis", axis, "dim", dim)
   if axis is None:
@@ -4448,8 +4450,20 @@ def dropout_v2(x, rate, noise_shape=None, seed=None, name=None):
       ret = gen_math_ops.real_div(x, gen_math_ops.sub(one_tensor, rate))
 
     noise_shape = _get_noise_shape(x, noise_shape)
-    # Sample a uniform distribution on [0.0, 1.0) and select values larger
-    # than rate.
+
+    if seed is None:
+        seed = 0
+
+    # Should there be ROCm support, use it. Otherwise fallback to generic
+    # implementation
+    if build_info.is_rocm_build and isinstance(seed, numbers.Real):
+      try:
+        return gen_nn_ops.dropout(x,rate,noise_shape=noise_shape,seed=seed)
+      except:
+        pass
+
+    # Sample a uniform distribution on [0.0, 1.0) and select values larger than
+    # rate.
     #
     # NOTE: Random uniform can only generate 2^23 floats on [1.0, 2.0)
     # and subtract 1.0.
