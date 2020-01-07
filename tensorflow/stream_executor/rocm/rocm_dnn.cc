@@ -298,6 +298,7 @@ namespace wrap {
   __macro(miopenDropoutForward)					     \
   __macro(miopenDropoutBackward)				     \
   __macro(miopenDropoutGetStatesSize)				     \
+  __macro(miopenRestoreDropoutDescriptor)			     \
   __macro(miopenSetDropoutDescriptor)				     \
   __macro(miopenLRNForward)                                          \
   __macro(miopenLRNBackward)                                         \
@@ -826,7 +827,7 @@ class ScopedConvolutionDescriptor {
 
 class ScopedDropoutDescriptor {
  public:
-  ScopedDropoutDescriptor(miopenHandle_t miopen_handle,
+  ScopedDropoutDescriptor(Stream* stream, miopenHandle_t miopen_handle,
                           const DropoutDescriptor& dropout_descriptor,
                           ScratchAllocator* state_allocator)
       : handle_(nullptr) {
@@ -836,38 +837,39 @@ class ScopedDropoutDescriptor {
                  << ToString(status);
     }
 
-    DeviceMemory<uint8> state_memory;
     if (state_allocator) {
-      size_t state_sizes_in_bytes = 0;
-      status = wrap::miopenDropoutGetStatesSize(miopen_handle,
-                                                &state_sizes_in_bytes);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "could not query miopen dropout state size: "
-                   << ToString(status);
-      }
-      auto allocated = state_allocator->AllocateBytes(state_sizes_in_bytes);
+      size_t mask_sizes_in_bytes = dropout_descriptor.mask().size();
+      auto allocated = state_allocator->AllocateBytes(mask_sizes_in_bytes);
       if (!allocated.ok() ||
-          (state_memory = allocated.ValueOrDie()) == nullptr) {
-        LOG(ERROR) << "Failed to allocate dropout workspace";
+          (mask_memory_ = allocated.ValueOrDie()) == nullptr) {
+        LOG(ERROR) << "Failed to allocate dropout mask";
         return;
       }
+      stream->ThenMemcpy(&mask_memory_, dropout_descriptor.mask().data(),
+                         dropout_descriptor.mask().size());
     }
 
     // Note that we hard code rng_mode now because there is only one node
     // available, and this option is not part of user API. In the future we may
     // consider exposing this as a field in DropoutDescriptor
-    status = wrap::miopenSetDropoutDescriptor(
-        handle_, miopen_handle, dropout_descriptor.rate(),
-        state_memory.opaque(), state_memory.size(), dropout_descriptor.seed(),
-        /*use_mask=*/false, /*state_evo=*/false,
+    //
+    // We use Restore instead of Set DropoutDescriptor because the RNG random
+    // generator is slow. Therefore, we set use_mask to True and use CPU
+    // generated random mask
+    status = wrap::miopenRestoreDropoutDescriptor(
+        handle_, miopen_handle, dropout_descriptor.rate(), nullptr, 0,
+        dropout_descriptor.seed(),
+        /*use_mask=*/true, /*state_evo=*/false,
         /*rng_mode=*/miopenRNGType_t::MIOPEN_RNG_PSEUDO_XORWOW);
     if (status != miopenStatusSuccess) {
-      LOG(FATAL) << "could not set miopen dropout descriptor: "
+      LOG(FATAL) << "could not restore miopen dropout descriptor: "
                  << ToString(status);
     }
   }
 
   miopenDropoutDescriptor_t handle() const { return handle_; }
+
+  DeviceMemory<uint8> mask() const { return mask_memory_; }
 
   ~ScopedDropoutDescriptor() {
     auto status = wrap::miopenDestroyDropoutDescriptor(handle_);
@@ -879,6 +881,7 @@ class ScopedDropoutDescriptor {
 
  private:
   miopenDropoutDescriptor_t handle_;  // Owned.
+  DeviceMemory<uint8> mask_memory_;   // Owned
   SE_DISALLOW_COPY_AND_ASSIGN(ScopedDropoutDescriptor);
 };
 
@@ -4079,13 +4082,14 @@ bool MIOpenSupport::DoDropoutForward(
   const ScopedTensorDescriptor src_desc{input_dimensions, miopenFloat};
   const ScopedTensorDescriptor dest_desc{output_dimensions, miopenFloat};
   const ScopedTensorDescriptor noise_desc{noise_dimensions, miopenFloat};
-  const ScopedDropoutDescriptor dropout_desc{miopen.handle(), dropout_params,
-                                             workspace_allocator};
+  const ScopedDropoutDescriptor dropout_desc{
+      stream, miopen.handle(), dropout_params, workspace_allocator};
 
   auto status = wrap::miopenDropoutForward(
       miopen.handle(), dropout_desc.handle(), noise_desc.handle(),
       src_desc.handle(), input_data.opaque(), dest_desc.handle(),
-      output_data->opaque(), nullptr, 0);
+      output_data->opaque(), dropout_desc.mask().opaque(),
+      dropout_desc.mask().size());
   if (status != miopenStatusSuccess) {
     LOG(ERROR) << "failed to enqueue forward dropout on stream: "
                << ToString(status);
@@ -4105,14 +4109,15 @@ bool MIOpenSupport::DoDropoutForward(
   auto miopen = miopen_->GetHandle(parent_, stream);
   const ScopedTensorDescriptor src_desc{input_dimensions, miopenHalf};
   const ScopedTensorDescriptor dest_desc{output_dimensions, miopenHalf};
-  const ScopedTensorDescriptor noise_desc{noise_dimensions, miopenHalf};
-  const ScopedDropoutDescriptor dropout_desc{miopen.handle(), dropout_params,
-                                             workspace_allocator};
-
+  const ScopedTensorDescriptor noise_desc{noise_dimensions, miopenFloat};
+  const ScopedDropoutDescriptor dropout_desc{
+      stream, miopen.handle(), dropout_params, workspace_allocator};
   auto status = wrap::miopenDropoutForward(
       miopen.handle(), dropout_desc.handle(), noise_desc.handle(),
       src_desc.handle(), input_data.opaque(), dest_desc.handle(),
-      output_data->opaque(), nullptr, 0);
+      output_data->opaque(), dropout_desc.mask().opaque(),
+      dropout_desc.mask().size());
+
   if (status != miopenStatusSuccess) {
     LOG(ERROR) << "failed to enqueue forward dropout on stream: "
                << ToString(status);
@@ -4135,14 +4140,14 @@ bool MIOpenSupport::DoDropoutBackward(
   const ScopedTensorDescriptor output_diff_desc{output_diff_dimensions,
                                                 miopenFloat};
   const ScopedTensorDescriptor noise_desc{noise_dimensions, miopenFloat};
-  const ScopedDropoutDescriptor dropout_desc{miopen.handle(), dropout_params,
-                                             workspace_allocator};
+  const ScopedDropoutDescriptor dropout_desc{
+      stream, miopen.handle(), dropout_params, workspace_allocator};
 
   auto status = wrap::miopenDropoutBackward(
       miopen.handle(), dropout_desc.handle(), noise_desc.handle(),
       /*dyDesc*/ input_diff_desc.handle(), /*dy*/ input_diff_data.opaque(),
       /*dxDesc*/ output_diff_desc.handle(), /*dx*/ output_diff_data->opaque(),
-      nullptr, 0);
+      dropout_desc.mask().opaque(), dropout_desc.mask().size());
 
   if (status != miopenStatusSuccess) {
     LOG(ERROR) << "failed to enqueue backward dropout on stream: "
@@ -4166,14 +4171,14 @@ bool MIOpenSupport::DoDropoutBackward(
   const ScopedTensorDescriptor output_diff_desc{output_diff_dimensions,
                                                 miopenHalf};
   const ScopedTensorDescriptor noise_desc{noise_dimensions, miopenFloat};
-  const ScopedDropoutDescriptor dropout_desc{miopen.handle(), dropout_params,
-                                             workspace_allocator};
+  const ScopedDropoutDescriptor dropout_desc{
+      stream, miopen.handle(), dropout_params, workspace_allocator};
 
   auto status = wrap::miopenDropoutBackward(
       miopen.handle(), dropout_desc.handle(), noise_desc.handle(),
       /*dyDesc*/ input_diff_desc.handle(), /*dy*/ input_diff_data.opaque(),
       /*dxDesc*/ output_diff_desc.handle(), /*dx*/ output_diff_data->opaque(),
-      nullptr, 0);
+      dropout_desc.mask().opaque(), dropout_desc.mask().size());
 
   if (status != miopenStatusSuccess) {
     LOG(ERROR) << "failed to enqueue backward dropout on stream: "

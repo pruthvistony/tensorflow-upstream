@@ -654,13 +654,19 @@ class DropoutDescriptor {
     rate_ = value;
     return *this;
   }
+  DropoutDescriptor& set_mask(const std::vector<uint8>& mask) {
+    mask_ = mask;
+    return *this;
+  }
 
   unsigned long long seed() const { return seed_; }
   float rate() const { return rate_; }
+  std::vector<uint8> mask() const { return mask_; }
 
  private:
   unsigned long long seed_;
   float rate_;
+  std::vector<uint8> mask_;
 };
 
 // A patch of values in the input can be pooled via either a max or an average
@@ -1663,18 +1669,6 @@ class DnnSupport {
       Stream* stream, const dnn::DropoutDescriptor& dropout_params,
       const dnn::BatchDescriptor& noise_dimensions,
       const dnn::BatchDescriptor& input_dimensions,
-      const DeviceMemory<double>& input_data,
-      const dnn::BatchDescriptor& output_dimensions,
-      DeviceMemory<double>* output_data,
-      ScratchAllocator* workspace_allocator = nullptr) {
-    LOG(FATAL) << "DoDropoutForward not implemented for double.";
-    return false;
-  }
-
-  virtual bool DoDropoutForward(
-      Stream* stream, const dnn::DropoutDescriptor& dropout_params,
-      const dnn::BatchDescriptor& noise_dimensions,
-      const dnn::BatchDescriptor& input_dimensions,
       const DeviceMemory<float>& input_data,
       const dnn::BatchDescriptor& output_dimensions,
       DeviceMemory<float>* output_data,
@@ -1691,30 +1685,7 @@ class DnnSupport {
       const dnn::BatchDescriptor& output_dimensions,
       DeviceMemory<Eigen::half>* output_data,
       ScratchAllocator* workspace_allocator = nullptr) {
-    LOG(FATAL) << "DoDropoutForward not implemented for Eigen::half.";
-    return false;
-  }
-
-  virtual bool DoDropoutForward(
-      Stream* stream, const dnn::DropoutDescriptor& dropout_params,
-      const dnn::BatchDescriptor& noise_dimensions,
-      const dnn::BatchDescriptor& input_dimensions,
-      const DeviceMemory<int8>& input_data,
-      const dnn::BatchDescriptor& output_dimensions,
-      DeviceMemory<int8>* output_data,
-      ScratchAllocator* workspace_allocator = nullptr) {
-    LOG(FATAL) << "DoDropoutForward not implemented for int8.";
-    return false;
-  }
-  virtual bool DoDropoutBackward(
-      Stream* stream, const dnn::DropoutDescriptor& dropout_params,
-      const dnn::BatchDescriptor& noise_dimensions,
-      const dnn::BatchDescriptor& input_dimensions,
-      const DeviceMemory<double>& input_data,
-      const dnn::BatchDescriptor& output_dimensions,
-      DeviceMemory<double>* output_data,
-      ScratchAllocator* workspace_allocator = nullptr) {
-    LOG(FATAL) << "DoDropoutBackward not implemented for double.";
+    LOG(FATAL) << "DoDropoutForward not implemented for half.";
     return false;
   }
 
@@ -1738,19 +1709,7 @@ class DnnSupport {
       const dnn::BatchDescriptor& output_dimensions,
       DeviceMemory<Eigen::half>* output_data,
       ScratchAllocator* workspace_allocator = nullptr) {
-    LOG(FATAL) << "DoDropoutBackward not implemented for Eigen::half.";
-    return false;
-  }
-
-  virtual bool DoDropoutBackward(
-      Stream* stream, const dnn::DropoutDescriptor& dropout_params,
-      const dnn::BatchDescriptor& noise_dimensions,
-      const dnn::BatchDescriptor& input_dimensions,
-      const DeviceMemory<int8>& input_data,
-      const dnn::BatchDescriptor& output_dimensions,
-      DeviceMemory<int8>* output_data,
-      ScratchAllocator* workspace_allocator = nullptr) {
-    LOG(FATAL) << "DoDropoutBackward not implemented for int8.";
+    LOG(FATAL) << "DoDropoutBackward not implemented for half.";
     return false;
   }
 
