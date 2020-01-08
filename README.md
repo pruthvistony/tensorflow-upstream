@@ -29,6 +29,51 @@ to
 [announce@tensorflow.org](https://groups.google.com/a/tensorflow.org/forum/#!forum/announce).
 See all the [mailing lists](https://www.tensorflow.org/community/forums).
 
+## Feature Prioritization Survey
+
+The TensorFlow team is working on building/improving features, and understands
+that it is very important to prioritize these efforts based on what TF users
+need.
+
+The goal of this short, < 5 minute
+[survey](https://google.qualtrics.com/jfe/form/SV_d5nqhCEbkDkQ7ad), is to help
+the TensorFlow team better understand what features to prioritize based on your
+feedback. Participation is of course optional.
+
+Take the survey
+[HERE](https://google.qualtrics.com/jfe/form/SV_d5nqhCEbkDkQ7ad).
+
+## Tensorflow ROCm port
+
+Please follow the instructions [here](https://github.com/RadeonOpenCompute/ROCm-docker/blob/master/quick-start.md) to set up your ROCm stack.
+A docker container: **rocm/tensorflow:latest(https://hub.docker.com/r/rocm/tensorflow/)** is readily available to be used:
+```
+alias drun='sudo docker run \
+      -it \
+      --network=host \
+      --device=/dev/kfd \
+      --device=/dev/dri \
+      --ipc=host \
+      --shm-size 16G \
+      --group-add video \
+      --cap-add=SYS_PTRACE \
+      --security-opt seccomp=unconfined \
+      -v $HOME/dockerx:/dockerx'
+
+drun rocm/tensorflow:latest
+```
+
+
+We maintain `tensorflow-rocm` whl packages on PyPI [here](https://pypi.org/project/tensorflow-rocm), to install tensorflow-rocm package using pip:
+```
+# Install some ROCm dependencies
+sudo apt install rocm-libs hipcub miopen-hip
+
+# Pip3 install the whl package from PyPI
+pip3 install --user tensorflow-rocm --upgrade
+```
+For details on Tensorflow ROCm port, please take a look at the [ROCm-specific README file](README.ROCm.md).
+
 ## Install
 
 See the [TensorFlow install guide](https://www.tensorflow.org/install) for the
@@ -150,3 +195,4 @@ Learn more about the
 ## License
 
 [Apache License 2.0](LICENSE)
+
