@@ -26,11 +26,6 @@ limitations under the License.
 #include "tensorflow/core/util/gpu_kernel_helper.h"
 #include "tensorflow/core/util/gpu_launch_config.h"
 
-#if TENSORFLOW_USE_ROCM
- #include "rocm/include/hip/hip_fp16.h"
-typedef __half2 half2;
-#endif
-
 namespace tensorflow {
 
 typedef Eigen::GpuDevice GPUDevice;
