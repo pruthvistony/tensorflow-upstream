@@ -23,9 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
-#include "third_party/cub/device/device_segmented_radix_sort.cuh"
-#include "third_party/cub/iterator/counting_input_iterator.cuh"
-#include "third_party/cub/iterator/transform_input_iterator.cuh"
+#include "gpu_prim.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -35,14 +33,6 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/util/gpu_kernel_helper.h"
-
-// Required for sorting Eigen::half
-namespace cub {
-template <>
-struct NumericTraits<Eigen::half>
-    : BaseTraits<FLOATING_POINT, true, false, unsigned short int, Eigen::half> {
-};
-}  // namespace cub
 
 namespace tensorflow {
 
