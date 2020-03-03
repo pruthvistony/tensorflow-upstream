@@ -19,6 +19,11 @@ limitations under the License.
 #include "tensorflow/core/kernels/cwise_ops_gpu_common.cu.h"
 #include "tensorflow/core/util/gpu_kernel_helper.h"
 
+#if TENSORFLOW_USE_ROCM
+#include "rocm/include/hip/hip_fp16.h"
+typedef __half2 half2;
+#endif
+
 namespace tensorflow {
 
 typedef Eigen::GpuDevice GPUDevice;
@@ -33,6 +38,12 @@ template <FMAType Type, typename T> __device__ T fma_op(T m1, T m2)
       return m2 - m1;
 }
 
+template <class T>
+__device__ T load_broadcast(const T* x) { return *x; }
+
+template<>
+__device__ __half2 load_broadcast(const __half2* x) { return __half2half2(*(const __half*)x); }
+
 //
 // Fast pathway: each tensor is either full-size or 1-element.
 //
@@ -43,11 +54,15 @@ __global__ void CwiseFusedMulAddKernel(GpuLaunchConfig cfg, T* out, const T* x1,
   constexpr bool broadcast_x1 = (N & 1);
   constexpr bool broadcast_y1 = (N & 2);
   constexpr bool broadcast_x2 = (N & 4);
+  T cx1 = load_broadcast(x1);
+  T cx2 = load_broadcast(x2);
+  T cy1 = load_broadcast(y1);
   GPU_1D_KERNEL_LOOP(i, cfg.virtual_thread_count) {
-    out[i]=fma_op<Type>(x1[broadcast_x1 ? 0 : i] * y1[broadcast_y1 ? 0 : i],
-             x2[broadcast_x2 ? 0 : i]);
+    out[i]=fma_op<Type>((broadcast_x1 ? cx1 : x1[i]) * (broadcast_y1 ? cy1 : y1[i]),
+             broadcast_x2 ? cx2 : x2[i]);
   }
 }
+
 
 template <typename T, int N, FMAType Type>
 __global__ void CwiseFusedMulAdd2Kernel(GpuLaunchConfig cfg, T* out,
@@ -70,10 +85,20 @@ void LaunchFusedMulAddOp<GPUDevice, T, Type>::execute(const GPUDevice& device,
                                                      T* out, const T* x1,
                                                      const T* y1, const T* x2,
                                                      uint64 elements) {
-  auto config = GetGpuLaunchConfig(elements, device);
-  TF_CHECK_OK(GpuLaunchKernel(CwiseFusedMulAddKernel<T, N, Type>,
-                              config.block_count, config.thread_per_block, 0,
-                              device.stream(), config, out, x1, y1, x2));
+  if(std::is_same<T, Eigen::half>::value && !(elements & 1)) {
+    auto config = GetGpuLaunchConfig(elements/2, device);
+    TF_CHECK_OK(GpuLaunchKernel(CwiseFusedMulAddKernel<half2, N, Type>,
+                                config.block_count, config.thread_per_block, 0,
+                                device.stream(), config, (half2*)out, 
+                                (const half2*)x1, (const half2*)y1, 
+                                (const half2*)x2));
+  }
+  else {
+    auto config = GetGpuLaunchConfig(elements, device);
+    TF_CHECK_OK(GpuLaunchKernel(CwiseFusedMulAddKernel<T, N, Type>,
+                                config.block_count, config.thread_per_block, 0,
+                                device.stream(), config, out, x1, y1, x2));
+  }
 }
 
 template <typename T, FMAType Type>
