@@ -127,7 +127,7 @@ ${python_bin_path} /tmp/check_tf.py 2>&1  >> ${OUTPUT_FILE}
 LD_DEBUG=libs ${python_bin_path} -c "import tensorflow"  2>>${OUTPUT_FILE} > /tmp/loadedlibs
 
 {
-  grep libcudnn.so /tmp/loadedlibs
+  grep libMIOpen.so /tmp/loadedlibs
   echo
   echo '== env =========================================================='
   if [ -z ${LD_LIBRARY_PATH+x} ]; then
@@ -143,15 +143,14 @@ LD_DEBUG=libs ${python_bin_path} -c "import tensorflow"  2>>${OUTPUT_FILE} > /tm
   
   
   echo
-  echo '== nvidia-smi ==================================================='
-  nvidia-smi 2>&1
+  echo '== rocm-smi ==================================================='
+  "/opt/rocm/bin/rocm-smi" 2>&1
   
   echo
-  echo '== cuda libs  ==================================================='
+  echo '== rocm info ==================================================='
 } >> ${OUTPUT_FILE}
 
-find /usr/local -type f -name 'libcudart*'  2>/dev/null | grep cuda |  grep -v "\\.cache" >> ${OUTPUT_FILE}
-find /usr/local -type f -name 'libudnn*'  2>/dev/null | grep cuda |  grep -v "\\.cache" >> ${OUTPUT_FILE}
+"/opt/rocm/bin/rocminfo" >> ${OUTPUT_FILE}
 
 {
   echo
