@@ -27,6 +27,7 @@ from tensorflow.python.framework import config
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import test_util
 from tensorflow.python.platform import gfile
+from tensorflow.python.platform import test
 from tensorflow.python.profiler import traceme
 
 
@@ -47,7 +48,8 @@ class ProfilerTest(test_util.TensorFlowTestCase):
     profile_pb.ParseFromString(profile_result)
     devices = frozenset(device.name for device in profile_pb.devices.values())
     self.assertIn('/host:CPU', devices)
-    if config.list_physical_devices('GPU'):
+    if not test.is_built_with_rocm() and config.list_physical_devices('GPU'):
+      # device tracing is not yet supported on the ROCm platform
       self.assertIn('/device:GPU:0', devices)
     events = frozenset(event.name for event in profile_pb.trace_events)
     self.assertIn('three_times_five', events)
