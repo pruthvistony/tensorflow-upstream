@@ -306,6 +306,32 @@ class L2NormalizeTest(test_lib.TestCase):
 
 class DropoutTest(test_lib.TestCase):
 
+  def testDropoutFloat16(self):
+    # Runs dropout with 0-1 tensor 10 times, sum the number of ones and validate
+    # that it is producing approximately the right number of ones over a large
+    # number of samples, based on the keep probability.
+    x_dim = 40
+    y_dim = 30
+    num_iter = 10
+    for keep_prob in [0.1, 0.5, 0.8]:
+      t = constant_op.constant(1.0, shape=[x_dim, y_dim], dtype=dtypes.float16)
+      dropout = nn_ops.dropout(t, rate=(1 - keep_prob))
+      final_count = 0
+      self.assertEqual([x_dim, y_dim], dropout.get_shape())
+      for _ in xrange(0, num_iter):
+        value = self.evaluate(dropout)
+        final_count += np.count_nonzero(value)
+        # Verifies that there are only two values: 0 and 1/keep_prob.
+        sorted_value = np.unique(np.sort(value))
+        self.assertEqual(0, sorted_value[0])
+        self.assertAllClose(1 / keep_prob, sorted_value[1], rtol=0.1, atol=0.1)
+
+      # Check that we are in the 15% error range
+      expected_count = x_dim * y_dim * keep_prob * num_iter
+      rel_error = math.fabs(final_count - expected_count) / expected_count
+      self.assertTrue(rel_error < 0.15)
+
+
   def testDropout(self):
     # Runs dropout with 0-1 tensor 10 times, sum the number of ones and validate
     # that it is producing approximately the right number of ones over a large
@@ -337,6 +363,9 @@ class DropoutTest(test_lib.TestCase):
     # that it is producing approximately the right number of ones over a large
     # number of samples, based on the keep probability. This time with shaped
     # noise.
+    if test_lib.is_built_with_rocm():
+      self.skipTest("MIOpen does not support noise_shape with a different dimension")
+
     x_dim = 40 * 30
     y_dim = 3
     num_iter = 10
@@ -361,6 +390,9 @@ class DropoutTest(test_lib.TestCase):
 
   def testShapedDropoutCorrelation(self):
     # Runs a shaped dropout and tests that the correlations are correct.
+    if test_lib.is_built_with_rocm():
+       self.skipTest("MIOpen does not support noise_shape with a different dimension")
+
     x_dim = 40
     y_dim = 30
     num_iter = 10
@@ -417,6 +449,9 @@ class DropoutTest(test_lib.TestCase):
     self.assertEqual(x.get_shape(), dropout_x.get_shape())
 
   def testPartialShapedDropout(self):
+    if test_lib.is_built_with_rocm():
+       self.skipTest("MIOpen does not support noise_shape with a different dimension")
+
     x_dim = 40 * 30
     y_dim = 3
     num_iter = 10
@@ -480,6 +515,9 @@ class DropoutTest(test_lib.TestCase):
 
   @test_util.run_deprecated_v1
   def testShapedDropoutShapeError(self):
+    if test_lib.is_built_with_rocm():
+       self.skipTest("MIOpen does not support noise_shape with a different dimension")
+
     # Runs shaped dropout and verifies an error is thrown on misshapen noise.
     x_dim = 40
     y_dim = 30

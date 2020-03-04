@@ -21,6 +21,7 @@ from __future__ import print_function
 from tensorflow.python.eager import backprop
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
+from tensorflow.python.platform import build_info
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_nn_ops
 from tensorflow.python.ops import math_ops
@@ -1063,7 +1064,6 @@ def _L2LossGrad(op, grad):
     The gradient, which is (x * grad).
   """
   return op.inputs[0] * grad
-
 
 @ops.RegisterGradient("TopK")
 @ops.RegisterGradient("TopKV2")

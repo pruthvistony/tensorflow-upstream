@@ -297,6 +297,8 @@ class NetworkConstructionTest(keras_parameterized.TestCase):
     self._assertAllIs(model.non_trainable_weights, weights)
 
   def test_layer_call_arguments(self):
+    if test.is_built_with_rocm:
+      self.skipTest('ROCm Dropout used MIOpen backend')
     with ops.Graph().as_default():
       # Test the ability to pass and serialize arguments to `call`.
       inp = keras.layers.Input(shape=(2,))
