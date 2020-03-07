@@ -69,6 +69,7 @@ class AutoMixedPrecisionLists {
         "CudnnRNNBackpropV3",
         "CudnnRNNV2",
         "CudnnRNNV3",
+        "Dropout",
         "GRUBlockCell",
         "GRUBlockCellGrad",
         "LSTMBlockCell",
