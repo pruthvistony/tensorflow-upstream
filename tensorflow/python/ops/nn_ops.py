@@ -4456,7 +4456,8 @@ def dropout_v2(x, rate, noise_shape=None, seed=None, name=None):
     def_dropout = os.environ.get("TF_ROCM_OLD_DROPOUT")
     if build_info.is_rocm_build and \
        (x.dtype == dtypes.float64 or x.dtype == dtypes.float32 \
-        or x.dtype == dtypes.float16) and def_dropout!="1":
+        or x.dtype == dtypes.float16) and def_dropout!="1" \
+        and noise_shape==array_ops.shape(x):
       if seed is None:
         seed = 0
       return gen_nn_ops.dropout(x,rate,noise_shape=noise_shape,seed=seed)
