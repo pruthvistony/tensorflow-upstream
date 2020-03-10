@@ -32,8 +32,7 @@ typedef Eigen::ThreadPoolDevice CPUDevice;
 template <typename T>
 void ApplyDropout<CPUDevice, T>::operator()(const CPUDevice& d, T* out,
                                             const T* in, const float* rng_data,
-                                            float rate, uint64 num_elements,
-                                            random::PhiloxRandom gen) {
+                                            float rate, uint64 num_elements, random::PhiloxRandom gen) {
   T scale = T(1. / (1. - rate));
   for (uint64 i = 0; i < num_elements; i++) {
     out[i] = (rng_data[i] > rate) ? in[i] * scale : T(0.0);
@@ -103,6 +102,8 @@ class DropoutOp : public OpKernel {
     typedef random::UniformDistribution<random::PhiloxRandom, float>
         Distribution;
     Distribution dist;
+    random::PhiloxRandom gen =
+      generator_.ReserveRandomOutputs(in0.NumElements(), 256);
 
     if (std::is_same<Device, CPUDevice>::value) {
       Tensor rng_data;
@@ -111,8 +112,6 @@ class DropoutOp : public OpKernel {
                                         TensorShape(in0.shape()), &rng_data));
       auto rng_flat = rng_data.flat<float>();
 
-      random::PhiloxRandom gen =
-          generator_.ReserveRandomOutputs(rng_flat.size(), 256);
       functor::FillPhiloxRandom<Device, Distribution>()(
           ctx, ctx->eigen_device<Device>(), gen, rng_flat.data(),
           rng_flat.size(), dist);

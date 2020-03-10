@@ -61,12 +61,12 @@ __global__ void RNGAndApplyDropoutKernel(random::PhiloxRandom gen, int64 size,
   Dist dist;
   static_assert(Dist::kVariableSamplesPerOutput == false,
                 "Wrong kVariableSamplesPerOutput");
-  static_assert(
-      Dist::kResultElementCount == 4 || Dist::kResultElementCount == 8,
-      "wrong kResultElementCount");
 
   // in half2 mode, RNG produces 8 half per call which we convert into 4 half2
+  // for simplicity, we keep RNG in float when T is half (otherwise upstream 
+  // code changes are needed)
   const int kGroupSize = Dist::kResultElementCount / (is_half2 ? 2 : 1);
+  static_assert(kGroupSize == 4, "wrong kResultElementCount");
 
   const int32 thread_id = blockIdx.x * blockDim.x + threadIdx.x;
   const int32 total_thread_count = gridDim.x * blockDim.x;
@@ -119,8 +119,8 @@ __global__ void ApplyDropoutGradKernel(Eigen::half* _outgrads,
 
 template <typename T>
 void ApplyDropout<GPUDevice, T>::operator()(const GPUDevice& d, T* out,
-                                            const T* in, const float* rng_data,
-                                            float rate, uint64 num_elements,
+                                            const T* in, const float* unused,
+                                            float rate, uint64 num_elements, 
                                             random::PhiloxRandom gen) {
   float scale = 1. / (1 - rate);
   bool do_half2 = std::is_same<T, Eigen::half>::value && !(num_elements & 1);
@@ -143,7 +143,7 @@ void ApplyDropout<GPUDevice, T>::operator()(const GPUDevice& d, T* out,
     TF_CHECK_OK(GpuLaunchKernel(RNGAndApplyDropoutKernel<T, float>, num_blocks,
                                 kThreadInBlock, 0, d.stream(), gen,
                                 num_elements, out, in, rate, scale));
-        }
+  }
 }
 
 template <typename T>
