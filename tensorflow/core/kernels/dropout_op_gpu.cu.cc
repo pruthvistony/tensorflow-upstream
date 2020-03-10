@@ -43,7 +43,8 @@ __global__ void RNGAndApplyDropoutKernel(random::PhiloxRandom gen, int64 size,
   constexpr bool is_half = std::is_same<T, Eigen::half>::value;
   constexpr bool is_half2 = std::is_same<T, __half2>::value;
 
-  // The RNG only knows how to generate half or float
+  // The RNG only knows how to generate half or float (TODO: implement 
+  // UniformDistribution for half2 to double the throughput)
   typedef
       typename std::conditional<is_half2, Eigen::half, float>::type DistGenType;
 
@@ -65,8 +66,8 @@ __global__ void RNGAndApplyDropoutKernel(random::PhiloxRandom gen, int64 size,
   // in half2 mode, RNG produces 8 half per call which we convert into 4 half2
   // for simplicity, we keep RNG in float when T is half (otherwise upstream 
   // code changes are needed)
-  const int kGroupSize = Dist::kResultElementCount / (is_half2 ? 2 : 1);
-  static_assert(kGroupSize == 4, "wrong kResultElementCount");
+  constexpr int kGroupSize = Dist::kResultElementCount / (is_half2 ? 2 : 1);
+  static_assert(Dist::kResultElementCount == 4, "wrong kResultElementCount");
 
   const int32 thread_id = blockIdx.x * blockDim.x + threadIdx.x;
   const int32 total_thread_count = gridDim.x * blockDim.x;
@@ -127,9 +128,8 @@ void ApplyDropout<GPUDevice, T>::operator()(const GPUDevice& d, T* out,
   if (do_half2) num_elements /= 2;
   int64 kThreadInBlock = 256;
   int64 kMaxBlock = do_half2 ? 1024 : 128;  // experimental best
-  uint64 num_groups =
-      (num_elements + random::PhiloxRandom::kResultElementCount - 1) /
-      random::PhiloxRandom::kResultElementCount;
+  int group_size = random::PhiloxRandom::kResultElementCount / (do_half2 ? 2 : 1);
+  uint64 num_groups = (num_elements + group_size - 1) / group_size;
 
   uint64 num_blocks = (num_groups + kThreadInBlock - 1) / kThreadInBlock;
   num_blocks = min(kMaxBlock, num_blocks);
