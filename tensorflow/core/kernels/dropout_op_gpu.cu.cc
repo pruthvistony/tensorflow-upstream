@@ -13,6 +13,7 @@
 #include "tensorflow/core/util/gpu_launch_config.h"
 #include "tensorflow/core/util/guarded_philox_random.h"
 #include "tensorflow/core/util/tensor_format.h"
+#include "tensorflow/core/util/env_var.h"
 #include "tensorflow/stream_executor/temporary_device_memory.h"
 #include "third_party/eigen3/Eigen/Core"
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
@@ -63,9 +64,7 @@ __global__ void RNGAndApplyDropoutKernel(random::PhiloxRandom gen, int64 size,
   static_assert(Dist::kVariableSamplesPerOutput == false,
                 "Wrong kVariableSamplesPerOutput");
 
-  // in half2 mode, RNG produces 8 half per call which we convert into 4 half2
-  // for simplicity, we keep RNG in float when T is half (otherwise upstream 
-  // code changes are needed)
+  // in half2 mode, RNG produces 4 half per call which we convert into 2 half2
   constexpr int kGroupSize = Dist::kResultElementCount / (is_half2 ? 2 : 1);
   static_assert(Dist::kResultElementCount == 4, "wrong kResultElementCount");
 
@@ -152,8 +151,10 @@ void ApplyDropoutGrad<GPUDevice, T>::operator()(const GPUDevice& d, T* outgrads,
                                                 const T* outs, float rate,
                                                 uint64 num_elements) {
   float scale = 1. / (1 - rate);
-  constexpr int32 kThreadInBlock = 256;
-  int64 kMaxBlock = 128;  // todo: benchmarking
+  int64 kThreadInBlock = 1024;
+  int64 kMaxBlock = 512;
+  //ReadInt64FromEnvVar("TF_DROP_THREADS", 256, &kThreadInBlock);
+  //ReadInt64FromEnvVar("TF_DROP_BLOCKS", 128, &kMaxBlock);
   TF_CHECK_OK(GpuLaunchKernel(
       ApplyDropoutGradKernel<T>,
       min(kMaxBlock, (num_elements + kThreadInBlock - 1) / kThreadInBlock),

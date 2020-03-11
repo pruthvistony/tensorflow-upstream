@@ -70,6 +70,7 @@ class AutoMixedPrecisionLists {
         "CudnnRNNV2",
         "CudnnRNNV3",
         "Dropout",
+        "DropoutGrad",
         "GRUBlockCell",
         "GRUBlockCellGrad",
         "LSTMBlockCell",
@@ -81,7 +82,11 @@ class AutoMixedPrecisionLists {
         // "DepthwiseConv2dNativeBackpropInput",
         "MatMul",
     };
+#if TENSORFLOW_USE_ROCM
+    if (true) {
+#else
     if (cuda_version >= 9010) {
+#endif
       // Fp16 BatchMatMul is slow before CUDA 9.1.
       list.insert("BatchMatMul");
       list.insert("BatchMatMulV2");
