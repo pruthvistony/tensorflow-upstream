@@ -2887,6 +2887,17 @@ def relu6(features, name=None):
 
 @tf_export("nn.gelu",v1=["nn.gelu"])
 def gelu(features, name=None):
+  """Gaussian Error Linear Unit.
+ 
+  This is a smoother version of the RELU.
+  Original paper: https://arxiv.org/abs/1606.08415
+  Args:
+    features: float Tensor to perform activation.
+    name: A name for the operation (optional).
+        
+  Returns:
+    `features` with the GELU activation applied.
+  """
   with ops.name_scope(name, "gelu", [features]) as name:
     features = ops.convert_to_tensor(features, name="features")
     return gen_nn_ops.gelu(features, name=name)
