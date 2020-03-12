@@ -37,6 +37,13 @@ __device__ void apply_dropout(__half2& out, __half2 in, __half2 rng,
   out = in * mask * scale;
 }
 
+__device__ void apply_dropout(__half2& out, __half2 in, float2 rng32,
+                              __half2 rate, __half2 scale) {
+  __half2 rng16 = __floats2half2_rn(rng32.x, rng32.y);
+  __half2 mask = __hgt2(rng16, rate);
+  out = in * mask * scale;
+}
+
 template <typename T, typename U>
 __global__ void RNGAndApplyDropoutKernel(random::PhiloxRandom gen, int64 size,
                                          T* _out, const T* _in, U rate,
@@ -44,15 +51,13 @@ __global__ void RNGAndApplyDropoutKernel(random::PhiloxRandom gen, int64 size,
   constexpr bool is_half = std::is_same<T, Eigen::half>::value;
   constexpr bool is_half2 = std::is_same<T, __half2>::value;
 
-  // The RNG only knows how to generate half or float (TODO: implement 
-  // UniformDistribution for half2 to double the throughput)
-  typedef
-      typename std::conditional<is_half2, Eigen::half, float>::type DistGenType;
-
-  // but, if we're running in half2, we'll cast its outputs pairwise to half2
-  // too
-  typedef
-      typename std::conditional<is_half2, __half2, float>::type DistApplyType;
+  // The RNG only knows how to generate half or float. Ideally we'd want to
+  // implement UniformDistribution for half2 to double the throughput, but
+  // //tensorflow/python:auto_mixed_precision_test expects RNG to match 
+  // between float16 and float32 for the same seed, so we're stuck with float
+  typedef float DistGenType;
+  typedef 
+    typename std::conditional<is_half2, float2, float>::type DistApplyType;
 
   // Cast inputs from Eigen::half to __half. TODO: is there a better way of
   // doing this?
