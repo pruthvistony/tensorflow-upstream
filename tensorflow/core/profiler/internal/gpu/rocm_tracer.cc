@@ -1,4 +1,4 @@
-/* Copyright 2019 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2020 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,41 +17,18 @@ limitations under the License.
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_map.h"
-#include "hip/hip_runtime.h"
 #include "roctracer/roctracer.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/gtl/cleanup.h"
 #include "tensorflow/core/lib/hash/hash.h"
-#include "tensorflow/core/platform/annotation.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/logging.h"
+#include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/mem.h"
+#include "tensorflow/core/profiler/internal/annotation_stack.h"
 
 namespace tensorflow {
 namespace profiler {
-
-namespace {
-
-Status ToStatus(roctracer_status_t result) {
-  if (result == ROCTRACER_STATUS_SUCCESS) {
-    return Status::OK();
-  }
-  const char* str = roctracer_error_string();
-  return errors::Unavailable("ROCTRACER error: ", str ? str : "<unknown>");
-}
-
-Status ToStatus(hipError_t result) {
-  if (result == hipSuccess) {
-    return Status::OK();
-  }
-  const char* str = hipGetErrorString(result);
-  return errors::Unavailable("ROCM error: ", str ? str : "<unknown>");
-}
-
-inline void LogIfError(const Status& status) {
-  if (status.ok()) return;
-  LOG(ERROR) << status.error_message();
-}
 
 #define RETURN_IF_ROCTRACER_ERROR(expr)                                      \
   do {                                                                       \
@@ -72,357 +49,346 @@ int32 GetCachedTID() {
   return current_thread_id;
 }
 
-std::tuple<size_t /*bytes*/, RocmTracerEventType, bool /*async*/>
-DecodeHipMemcpy(uint32_t cbid, const void* cbdata) {
-  const hip_api_data_t* data = reinterpret_cast<const hip_api_data_t*>(cbdata);
-
-  switch (cbid) {
-    case HIP_API_ID_hipMemcpyDtoH: {
-      return std::make_tuple(data->args.hipMemcpyDtoH.sizeBytes,
-                             RocmTracerEventType::MemcpyD2H, false);
-    }
-    case HIP_API_ID_hipMemcpyDtoHAsync: {
-      return std::make_tuple(data->args.hipMemcpyDtoHAsync.sizeBytes,
-                             RocmTracerEventType::MemcpyD2H, true);
-    }
-    case HIP_API_ID_hipMemcpyHtoD: {
-      return std::make_tuple(data->args.hipMemcpyHtoD.sizeBytes,
-                             RocmTracerEventType::MemcpyH2D, false);
-    }
-    case HIP_API_ID_hipMemcpyHtoDAsync: {
-      return std::make_tuple(data->args.hipMemcpyHtoDAsync.sizeBytes,
-                             RocmTracerEventType::MemcpyH2D, true);
-    }
-    case HIP_API_ID_hipMemcpyDtoD: {
-      return std::make_tuple(data->args.hipMemcpyDtoD.sizeBytes,
-                             RocmTracerEventType::MemcpyD2D, false);
-    }
-    case HIP_API_ID_hipMemcpyDtoDAsync: {
-      return std::make_tuple(data->args.hipMemcpyDtoDAsync.sizeBytes,
-                             RocmTracerEventType::MemcpyD2D, true);
-    }
-    default: {
-      LOG(ERROR) << "Unsupported memcpy activity observed: " << cbid;
-      return std::make_tuple(0, RocmTracerEventType::Unsupported, false);
-    }
-  }
-}
-
-// Rocm callback corresponding to a HIP API. This global function
-// is invoked twice for each API: at entry and at exit. The cbdata
-// parameter is guaranteed by Rocm to be thread-safe. Most invocations are
-// dropped to the floor and entry/exit is tracked for the APIs we deem
-// performance-relevant.
-void ApiCallback(uint32_t domain, uint32_t cbid, const void* cbdata,
-                 void* user_data) {
-  RocmTracer* tracer = reinterpret_cast<RocmTracer*>(user_data);
-  tracer->HandleCallback(domain, cbid, cbdata).IgnoreError();
-}
-
-void ActivityCallback(const char* begin, const char* end, void* user_data) {
-  RocmTracer* tracer = reinterpret_cast<RocmTracer*>(user_data);
-  tracer->ProcessActivityRecord(begin, end);
-}
-
-void AddKernelEventUponApiExit(RocmTraceCollector* collector,
-                               const void* cbdata) {
-  const hip_api_data_t* data = reinterpret_cast<const hip_api_data_t*>(cbdata);
-  const hipFunction_t kernelFunc = data->args.hipModuleLaunchKernel.f;
-  RocmTracerEvent event;
-  event.domain = RocmTracerEventDomain::HIP;
-  event.type = RocmTracerEventType::Kernel;
-  event.source = RocmTracerEventSource::ApiCallback;
-  if (kernelFunc != nullptr) event.name = hipKernelNameRef(kernelFunc);
-  event.thread_id = GetCachedTID();
-  event.correlation_id = data->correlation_id;
-
-  event.kernel_info.dynamic_shared_memory_usage =
-      data->args.hipModuleLaunchKernel.sharedMemBytes;
-  event.kernel_info.block_x = data->args.hipModuleLaunchKernel.blockDimX;
-  event.kernel_info.block_y = data->args.hipModuleLaunchKernel.blockDimY;
-  event.kernel_info.block_z = data->args.hipModuleLaunchKernel.blockDimZ;
-  event.kernel_info.grid_x = data->args.hipModuleLaunchKernel.gridDimX;
-  event.kernel_info.grid_y = data->args.hipModuleLaunchKernel.gridDimY;
-  event.kernel_info.grid_z = data->args.hipModuleLaunchKernel.gridDimZ;
-
-  VLOG(3) << "HIP Kernel Launched: " << event.name;
-  collector->AddEvent(std::move(event));
-}
-
-// Performs the actual callback for both normal and P2P memcpy operations.
-RocmTracerEvent PopulateMemcpyCallbackEvent(RocmTracerEventType type,
-                                            uint32_t cbid, const void* cbdata,
-                                            size_t num_bytes, bool async) {
-  const hip_api_data_t* data = reinterpret_cast<const hip_api_data_t*>(cbdata);
-  RocmTracerEvent event;
-  event.domain = RocmTracerEventDomain::HIP;
-  event.name = roctracer_op_string(ACTIVITY_DOMAIN_HIP_API, cbid, 0);
-  event.type = type;
-  event.source = RocmTracerEventSource::ApiCallback;
-  event.thread_id = GetCachedTID();
-  event.correlation_id = data->correlation_id;
-  event.memcpy_info.num_bytes = num_bytes;
-  event.memcpy_info.async = async;
-  // ROCM TODO: figure out a way to properly populate this field.
-  event.memcpy_info.destination = 0;
-  return event;
-}
-
-void AddNormalMemcpyEventUponApiExit(RocmTraceCollector* collector,
-                                     uint32_t cbid, const void* cbdata) {
-  size_t num_bytes;
-  RocmTracerEventType type;
-  bool async;
-  std::tie(num_bytes, type, async) = DecodeHipMemcpy(cbid, cbdata);
-
-  VLOG(3) << "HIP Memcpy observed :" << num_bytes;
-  RocmTracerEvent event =
-      PopulateMemcpyCallbackEvent(type, cbid, cbdata, num_bytes, async);
-  collector->AddEvent(std::move(event));
-}
-
-void AddMallocEventUponApiExit(RocmTraceCollector* collector, uint32_t cbid,
-                               const void* cbdata) {
-  const hip_api_data_t* data = reinterpret_cast<const hip_api_data_t*>(cbdata);
-  RocmTracerEvent event;
-  event.domain = RocmTracerEventDomain::HIP;
-  event.name = roctracer_op_string(ACTIVITY_DOMAIN_HIP_API, cbid, 0);
-  event.type = RocmTracerEventType::MemoryAlloc;
-  event.source = RocmTracerEventSource::ApiCallback;
-  event.thread_id = GetCachedTID();
-  event.correlation_id = data->correlation_id;
-  switch (cbid) {
-    case HIP_API_ID_hipMalloc:
-      VLOG(3) << "HIP Malloc observed: " << data->args.hipMalloc.size;
-      event.memalloc_info.num_bytes = data->args.hipMalloc.size;
-      break;
-    case HIP_API_ID_hipFree:
-      VLOG(3) << "HIP Free observed";
-      event.memalloc_info.num_bytes = 0;
-      break;
-  }
-  collector->AddEvent(std::move(event));
-}
-
-void AddGenericEventUponApiExit(RocmTraceCollector* collector, uint32_t cbid,
-                                const void* cbdata) {
-  const hip_api_data_t* data = reinterpret_cast<const hip_api_data_t*>(cbdata);
-  RocmTracerEvent event;
-  event.domain = RocmTracerEventDomain::HIP;
-  event.name = roctracer_op_string(ACTIVITY_DOMAIN_HIP_API, cbid, 0);
-  event.type = RocmTracerEventType::Generic;
-  event.source = RocmTracerEventSource::ApiCallback;
-  event.thread_id = GetCachedTID();
-  event.correlation_id = data->correlation_id;
-
-  collector->AddEvent(std::move(event));
-}
-
-void AddHipKernelActivityEvent(RocmTraceCollector* collector,
-                               AnnotationMap* annotation_map,
-                               const void* data) {
-  const roctracer_record_t* record =
-      reinterpret_cast<const roctracer_record_t*>(data);
-  const char* name =
-      roctracer_op_string(record->domain, record->op, record->kind);
-
-  RocmTracerEvent event;
-  event.domain = RocmTracerEventDomain::HIP;
-  event.type = RocmTracerEventType::Kernel;
-  event.source = RocmTracerEventSource::Activity;
-
-  event.name = name;
-  event.start_time_ns = record->begin_ns;
-  event.end_time_ns = record->end_ns;
-  event.correlation_id = record->correlation_id;
-  event.annotation = annotation_map->LookUp(event.correlation_id);
-
-  collector->AddEvent(std::move(event));
-}
-
-void AddHccKernelActivityEvent(RocmTraceCollector* collector,
-                               AnnotationMap* annotation_map,
-                               const void* data) {
-  const roctracer_record_t* record =
-      reinterpret_cast<const roctracer_record_t*>(data);
-  const char* name =
-      roctracer_op_string(record->domain, record->op, record->kind);
-
-  RocmTracerEvent event;
-  event.domain = RocmTracerEventDomain::HCC;
-  event.type = RocmTracerEventType::Kernel;
-  event.source = RocmTracerEventSource::Activity;
-
-  event.name = name;
-  event.start_time_ns = record->begin_ns;
-  event.end_time_ns = record->end_ns;
-  event.device_id = record->device_id;
-  event.stream_id = record->queue_id;
-  event.correlation_id = record->correlation_id;
-  event.annotation = annotation_map->LookUp(event.correlation_id);
-
-  collector->AddEvent(std::move(event));
-}
-
-void AddHipMemcpyActivityEvent(RocmTraceCollector* collector,
-                               AnnotationMap* annotation_map,
-                               const void* data) {
-  const roctracer_record_t* record =
-      reinterpret_cast<const roctracer_record_t*>(data);
-  const char* name =
-      roctracer_op_string(record->domain, record->op, record->kind);
-
-  RocmTracerEvent event;
-  event.domain = RocmTracerEventDomain::HIP;
-  switch (record->op) {
-    case HIP_API_ID_hipMemcpyDtoH:
-      event.type = RocmTracerEventType::MemcpyD2H;
-      event.name = name;
-      event.memcpy_info.num_bytes = record->bytes;
-      event.memcpy_info.async = false;
-      event.memcpy_info.destination = record->device_id;
-      break;
-    case HIP_API_ID_hipMemcpyDtoHAsync:
-      event.type = RocmTracerEventType::MemcpyD2H;
-      event.name = name;
-      event.memcpy_info.num_bytes = record->bytes;
-      event.memcpy_info.async = true;
-      event.memcpy_info.destination = record->device_id;
-      break;
-    case HIP_API_ID_hipMemcpyHtoD:
-      event.type = RocmTracerEventType::MemcpyH2D;
-      event.name = name;
-      event.memcpy_info.num_bytes = record->bytes;
-      event.memcpy_info.async = false;
-      event.memcpy_info.destination = record->device_id;
-      break;
-    case HIP_API_ID_hipMemcpyHtoDAsync:
-      event.type = RocmTracerEventType::MemcpyH2D;
-      event.name = name;
-      event.memcpy_info.num_bytes = record->bytes;
-      event.memcpy_info.async = true;
-      event.memcpy_info.destination = record->device_id;
-      break;
-    case HIP_API_ID_hipMemcpyDtoD:
-      event.type = RocmTracerEventType::MemcpyD2D;
-      event.name = name;
-      event.memcpy_info.num_bytes = record->bytes;
-      event.memcpy_info.async = false;
-      // ROCM TODO: figure out a way to properly populate this field.
-      event.memcpy_info.destination = record->device_id;
-      break;
-    case HIP_API_ID_hipMemcpyDtoDAsync:
-      event.type = RocmTracerEventType::MemcpyD2D;
-      event.name = name;
-      event.memcpy_info.num_bytes = record->bytes;
-      event.memcpy_info.async = true;
-      // ROCM TODO: figure out a way to properly populate this field.
-      event.memcpy_info.destination = record->device_id;
-      break;
-    default:
-      event.type = RocmTracerEventType::MemcpyOther;
-      event.name = name;
-      event.memcpy_info.num_bytes = record->bytes;
-      event.memcpy_info.async = false;
-      event.memcpy_info.destination = record->device_id;
-      break;
-  }
-  event.source = RocmTracerEventSource::Activity;
-  event.start_time_ns = record->begin_ns;
-  event.end_time_ns = record->end_ns;
-
-  event.correlation_id = record->correlation_id;
-  event.annotation = annotation_map->LookUp(event.correlation_id);
-  collector->AddEvent(std::move(event));
-}
-
-void AddHccMemcpyActivityEvent(RocmTraceCollector* collector,
-                               AnnotationMap* annotation_map,
-                               const void* data) {
-  const roctracer_record_t* record =
-      reinterpret_cast<const roctracer_record_t*>(data);
-  const char* name =
-      roctracer_op_string(record->domain, record->op, record->kind);
-
-  RocmTracerEvent event;
-  event.source = RocmTracerEventSource::Activity;
-  event.start_time_ns = record->begin_ns;
-  event.end_time_ns = record->end_ns;
-
-  // Set MemcpyOther here. The field won't really be used when we aggregate
-  // with other RocmTracerEvent instances coming from API callbacks.
-  event.type = RocmTracerEventType::MemcpyOther;
-
-  event.domain = RocmTracerEventDomain::HCC;
-  event.name = name;
-  event.device_id = record->device_id;
-  event.stream_id = record->queue_id;
-
-  event.correlation_id = record->correlation_id;
-  event.annotation = annotation_map->LookUp(event.correlation_id);
-  collector->AddEvent(std::move(event));
-}
-
-// This hook uses cupti activity api to measure device side activities.
-class RocmApiHookImpl : public RocmApiHook {
+class RocmApiCallbackImpl {
  public:
-  RocmApiHookImpl(const RocmTracerOptions& option,
-                  RocmTraceCollector* collector, AnnotationMap* annotation_map)
-      : option_(option),
-        collector_(collector),
-        annotation_map_(annotation_map) {}
+  RocmApiCallbackImpl(const RocmTracerOptions& options,
+                      RocmTraceCollector* collector)
+      : options_(options), collector_(collector) {}
 
-  Status OnApiEnter(uint32_t domain, uint32_t cbid,
-                    const void* cbdata) override {
+  Status operator()(uint32_t domain, uint32_t cbid, const void* cbdata) {
+    if (domain != ACTIVITY_DOMAIN_HIP_API) return Status::OK();
+
+    const hip_api_data_t* data =
+        reinterpret_cast<const hip_api_data_t*>(cbdata);
+
+    const char* name = roctracer_op_string(domain, cbid, 0);
+    VLOG(3) << "HIP API: " << name;
+    VLOG(3) << "domain: " << domain << " op: " << cbid
+            << " correlation_id: " << data->correlation_id;
+
+    if (data->phase == ACTIVITY_API_PHASE_ENTER) {
+      // Nothing to do here
+    } else if (data->phase == ACTIVITY_API_PHASE_EXIT) {
+      // todoo
+      // // Set up the map from correlation id to annotation string.
+      // const std::string& annotation =
+      //     tensorflow::Annotation::CurrentAnnotation();
+      // if (!annotation.empty()) {
+      //   annotation_map_->Add(data->correlation_id, annotation);
+      // }
+
+      switch (cbid) {
+        case HIP_API_ID_hipModuleLaunchKernel:
+          AddKernelEventUponApiExit(cbid, data);
+          break;
+        case HIP_API_ID_hipMemcpyDtoH:
+        case HIP_API_ID_hipMemcpyDtoHAsync:
+        case HIP_API_ID_hipMemcpyHtoD:
+        case HIP_API_ID_hipMemcpyHtoDAsync:
+        case HIP_API_ID_hipMemcpyDtoD:
+        case HIP_API_ID_hipMemcpyDtoDAsync:
+          AddMemcpyEventUponApiExit(cbid, data);
+          break;
+        case HIP_API_ID_hipMalloc:
+        case HIP_API_ID_hipFree:
+          AddMallocEventUponApiExit(cbid, data);
+          break;
+        default:
+          AddGenericEventUponApiExit(cbid, data);
+          break;
+      }
+    }
     return Status::OK();
   }
-  Status OnApiExit(uint32_t domain, uint32_t cbid,
-                   const void* cbdata) override {
-    // If we are not collecting CPU events from Callback API, we can return now.
-    if (!option_.required_callback_api_events) {
-      return Status::OK();
-    }
-    return AddApiCallbackEvent(collector_, domain, cbid, cbdata);
-  }
-  Status Flush() override { return Status::OK(); }
 
  private:
-  const RocmTracerOptions option_;
-  RocmTraceCollector* collector_;
-  AnnotationMap* annotation_map_;
+  void AddKernelEventUponApiExit(uint32_t cbid, const hip_api_data_t* data) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HIP;
+    event.type = RocmTracerEventType::Kernel;
+    event.source = RocmTracerEventSource::ApiCallback;
+    const hipFunction_t kernelFunc = data->args.hipModuleLaunchKernel.f;
+    if (kernelFunc != nullptr) event.name = hipKernelNameRef(kernelFunc);
+    event.thread_id = GetCachedTID();
+    event.correlation_id = data->correlation_id;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(RocmApiHookImpl);
-};
-}  // namespace
+    event.kernel_info.dynamic_shared_memory_usage =
+        data->args.hipModuleLaunchKernel.sharedMemBytes;
+    event.kernel_info.block_x = data->args.hipModuleLaunchKernel.blockDimX;
+    event.kernel_info.block_y = data->args.hipModuleLaunchKernel.blockDimY;
+    event.kernel_info.block_z = data->args.hipModuleLaunchKernel.blockDimZ;
+    event.kernel_info.grid_x = data->args.hipModuleLaunchKernel.gridDimX;
+    event.kernel_info.grid_y = data->args.hipModuleLaunchKernel.gridDimY;
+    event.kernel_info.grid_z = data->args.hipModuleLaunchKernel.gridDimZ;
 
-/*static*/ Status RocmApiHook::AddApiCallbackEvent(
-    RocmTraceCollector* collector, uint32_t domain, uint32_t cbid,
-    const void* cbdata) {
-  switch (cbid) {
-    case HIP_API_ID_hipModuleLaunchKernel:
-      AddKernelEventUponApiExit(collector, cbdata);
-      break;
-    case HIP_API_ID_hipMemcpyDtoH:
-    case HIP_API_ID_hipMemcpyDtoHAsync:
-    case HIP_API_ID_hipMemcpyHtoD:
-    case HIP_API_ID_hipMemcpyHtoDAsync:
-    case HIP_API_ID_hipMemcpyDtoD:
-    case HIP_API_ID_hipMemcpyDtoDAsync:
-      AddNormalMemcpyEventUponApiExit(collector, cbid, cbdata);
-      break;
-    // ROCM TODO: decide whether to log these API events.
-    // case HIP_API_ID_hipMalloc:
-    // case HIP_API_ID_hipFree:
-    //  AddMallocEventUponApiExit(collector, cbid, cbdata);
-    //  break;
-    // default:
-    //  AddGenericEventUponApiExit(collector, cbid, cbdata);
-    //  break;
-    default:
-      break;
+    VLOG(3) << "HIP Kernel Launched: " << event.name;
+    collector_->AddEvent(std::move(event));
   }
-  return Status::OK();
-}
+
+  void AddMemcpyEventUponApiExit(uint32_t cbid, const hip_api_data_t* data) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HIP;
+    event.name = roctracer_op_string(ACTIVITY_DOMAIN_HIP_API, cbid, 0);
+    event.source = RocmTracerEventSource::ApiCallback;
+    event.thread_id = GetCachedTID();
+    event.correlation_id = data->correlation_id;
+
+    // ROCM TODO: figure out a way to properly populate this field.
+    event.memcpy_info.destination = 0;
+    switch (cbid) {
+      case HIP_API_ID_hipMemcpyDtoH:
+        event.type = RocmTracerEventType::MemcpyD2H;
+        event.memcpy_info.num_bytes = data->args.hipMemcpyDtoH.sizeBytes;
+        event.memcpy_info.async = false;
+        break;
+      case HIP_API_ID_hipMemcpyDtoHAsync:
+        event.type = RocmTracerEventType::MemcpyD2H;
+        event.memcpy_info.num_bytes = data->args.hipMemcpyDtoHAsync.sizeBytes;
+        event.memcpy_info.async = true;
+        break;
+      case HIP_API_ID_hipMemcpyHtoD:
+        event.type = RocmTracerEventType::MemcpyH2D;
+        event.memcpy_info.num_bytes = data->args.hipMemcpyHtoD.sizeBytes;
+        event.memcpy_info.async = false;
+        break;
+      case HIP_API_ID_hipMemcpyHtoDAsync:
+        event.type = RocmTracerEventType::MemcpyH2D;
+        event.memcpy_info.num_bytes = data->args.hipMemcpyHtoDAsync.sizeBytes;
+        event.memcpy_info.async = true;
+        break;
+      case HIP_API_ID_hipMemcpyDtoD:
+        event.type = RocmTracerEventType::MemcpyD2D;
+        event.memcpy_info.num_bytes = data->args.hipMemcpyDtoD.sizeBytes;
+        event.memcpy_info.async = false;
+        break;
+      case HIP_API_ID_hipMemcpyDtoDAsync:
+        event.type = RocmTracerEventType::MemcpyD2D;
+        event.memcpy_info.num_bytes = data->args.hipMemcpyDtoDAsync.sizeBytes;
+        event.memcpy_info.async = true;
+        break;
+      default:
+        LOG(ERROR) << "Unsupported memcpy activity observed: " << cbid;
+        break;
+    }
+    VLOG(3) << "HIP Memcpy observed :" << event.memcpy_info.num_bytes;
+    collector_->AddEvent(std::move(event));
+  }
+
+  void AddMallocEventUponApiExit(uint32_t cbid, const hip_api_data_t* data) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HIP;
+    event.type = RocmTracerEventType::MemoryAlloc;
+    event.source = RocmTracerEventSource::ApiCallback;
+    event.name = roctracer_op_string(ACTIVITY_DOMAIN_HIP_API, cbid, 0);
+    event.thread_id = GetCachedTID();
+    event.correlation_id = data->correlation_id;
+
+    switch (cbid) {
+      case HIP_API_ID_hipMalloc:
+        VLOG(3) << "HIP Malloc observed: " << data->args.hipMalloc.size;
+        event.memalloc_info.num_bytes = data->args.hipMalloc.size;
+        break;
+      case HIP_API_ID_hipFree:
+        VLOG(3) << "HIP Free observed";
+        event.memalloc_info.num_bytes = 0;
+        break;
+    }
+    collector_->AddEvent(std::move(event));
+  }
+
+  void AddGenericEventUponApiExit(uint32_t cbid, const hip_api_data_t* data) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HIP;
+    event.type = RocmTracerEventType::Generic;
+    event.source = RocmTracerEventSource::ApiCallback;
+    event.name = roctracer_op_string(ACTIVITY_DOMAIN_HIP_API, cbid, 0);
+    event.thread_id = GetCachedTID();
+    event.correlation_id = data->correlation_id;
+
+    collector_->AddEvent(std::move(event));
+  }
+
+  RocmTracerOptions options_;
+  RocmTraceCollector* collector_ = nullptr;
+};
+
+class RocmActivityCallbackImpl {
+ public:
+  RocmActivityCallbackImpl(const RocmTracerOptions& options,
+                           RocmTraceCollector* collector)
+      : options_(options), collector_(collector) {}
+
+  Status operator()(const char* begin, const char* end) {
+    const roctracer_record_t* record =
+        reinterpret_cast<const roctracer_record_t*>(begin);
+    const roctracer_record_t* end_record =
+        reinterpret_cast<const roctracer_record_t*>(end);
+
+    while (record < end_record) {
+      const char* name =
+          roctracer_op_string(record->domain, record->op, record->kind);
+      VLOG(3) << "activity: " << name;
+      VLOG(3) << "domain: " << record->domain << " op: " << record->op
+              << " correlation_id: " << record->correlation_id
+              << " begin_ns: " << record->begin_ns
+              << " end_ns: " << record->end_ns;
+
+      switch (record->domain) {
+        // HIP API activities.
+        case ACTIVITY_DOMAIN_HIP_API:
+          switch (record->op) {
+            case HIP_API_ID_hipModuleLaunchKernel:
+              AddHipKernelActivityEvent(record);
+              break;
+
+            case HIP_API_ID_hipMemcpyDtoH:
+            case HIP_API_ID_hipMemcpyHtoD:
+            case HIP_API_ID_hipMemcpyDtoD:
+            case HIP_API_ID_hipMemcpyDtoHAsync:
+            case HIP_API_ID_hipMemcpyHtoDAsync:
+            case HIP_API_ID_hipMemcpyDtoDAsync:
+              AddHipMemcpyActivityEvent(record);
+              break;
+            default:
+              break;
+          }  // switch (record->op).
+          break;
+
+        // HCC ops activities.
+        case ACTIVITY_DOMAIN_HCC_OPS:
+          switch (record->op) {
+            case 0:  // dispatch
+              AddHccKernelActivityEvent(record);
+              break;
+            case 1:  // copy
+              AddHccMemcpyActivityEvent(record);
+              break;
+            // ROCM TODO: decide whther to log these activities later.
+            // case 2: // barrier / marker
+            //  break;
+            default:
+              break;
+          }  // switch (record->op).
+          break;
+      }
+
+      RETURN_IF_ROCTRACER_ERROR(static_cast<roctracer_status_t>(
+          roctracer_next_record(record, &record)));
+    }
+    return Status::OK();
+  }
+
+ private:
+  void AddHipKernelActivityEvent(const roctracer_record_t* record) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HIP;
+    event.type = RocmTracerEventType::Kernel;
+    event.source = RocmTracerEventSource::Activity;
+    event.name = roctracer_op_string(record->domain, record->op, record->kind);
+    event.correlation_id = record->correlation_id;
+    // todoo
+    // event.annotation = annotation_map->LookUp(event.correlation_id);
+
+    event.start_time_ns = record->begin_ns;
+    event.end_time_ns = record->end_ns;
+
+    collector_->AddEvent(std::move(event));
+  }
+
+  void AddHipMemcpyActivityEvent(const roctracer_record_t* record) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HIP;
+    event.source = RocmTracerEventSource::Activity;
+    event.name = roctracer_op_string(record->domain, record->op, record->kind);
+    event.correlation_id = record->correlation_id;
+    // todoo
+    // event.annotation = annotation_map->LookUp(event.correlation_id);
+
+    event.memcpy_info.num_bytes = record->bytes;
+    event.memcpy_info.destination = record->device_id;
+
+    switch (record->op) {
+      case HIP_API_ID_hipMemcpyDtoH:
+        event.type = RocmTracerEventType::MemcpyD2H;
+        event.memcpy_info.async = false;
+        break;
+      case HIP_API_ID_hipMemcpyDtoHAsync:
+        event.type = RocmTracerEventType::MemcpyD2H;
+        event.memcpy_info.async = true;
+        break;
+      case HIP_API_ID_hipMemcpyHtoD:
+        event.type = RocmTracerEventType::MemcpyH2D;
+        event.memcpy_info.async = false;
+        break;
+      case HIP_API_ID_hipMemcpyHtoDAsync:
+        event.type = RocmTracerEventType::MemcpyH2D;
+        event.memcpy_info.async = true;
+        break;
+      case HIP_API_ID_hipMemcpyDtoD:
+        event.type = RocmTracerEventType::MemcpyD2D;
+        event.memcpy_info.async = false;
+        // ROCM TODO: figure out a way to properly populate this field.
+        event.memcpy_info.destination = record->device_id;
+        break;
+      case HIP_API_ID_hipMemcpyDtoDAsync:
+        event.type = RocmTracerEventType::MemcpyD2D;
+        event.memcpy_info.async = true;
+        // ROCM TODO: figure out a way to properly populate this field.
+        event.memcpy_info.destination = record->device_id;
+        break;
+      default:
+        event.type = RocmTracerEventType::MemcpyOther;
+        event.memcpy_info.async = false;
+        event.memcpy_info.destination = record->device_id;
+        break;
+    }
+
+    event.start_time_ns = record->begin_ns;
+    event.end_time_ns = record->end_ns;
+
+    collector_->AddEvent(std::move(event));
+  }
+  void AddHccKernelActivityEvent(const roctracer_record_t* record) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HCC;
+    event.type = RocmTracerEventType::Kernel;
+    event.source = RocmTracerEventSource::Activity;
+    event.name = roctracer_op_string(record->domain, record->op, record->kind);
+    event.correlation_id = record->correlation_id;
+    // todoo
+    // event.annotation = annotation_map->LookUp(event.correlation_id);
+
+    event.start_time_ns = record->begin_ns;
+    event.end_time_ns = record->end_ns;
+    event.device_id = record->device_id;
+    event.stream_id = record->queue_id;
+
+    collector_->AddEvent(std::move(event));
+  }
+
+  void AddHccMemcpyActivityEvent(const roctracer_record_t* record) {
+    RocmTracerEvent event;
+    event.domain = RocmTracerEventDomain::HCC;
+    // Set MemcpyOther here. The field won't really be used when we aggregate
+    // with other RocmTracerEvent instances coming from API callbacks.
+    event.type = RocmTracerEventType::MemcpyOther;
+    event.source = RocmTracerEventSource::Activity;
+    event.name = roctracer_op_string(record->domain, record->op, record->kind);
+    event.correlation_id = record->correlation_id;
+    // todoo
+    // event.annotation = annotation_map->LookUp(event.correlation_id);
+
+    event.start_time_ns = record->begin_ns;
+    event.end_time_ns = record->end_ns;
+    event.device_id = record->device_id;
+    event.stream_id = record->queue_id;
+
+    collector_->AddEvent(std::move(event));
+  }
+
+  RocmTracerOptions options_;
+  RocmTraceCollector* collector_ = nullptr;
+};
 
 const char* GetTraceEventTypeName(const RocmTracerEventType& type) {
   switch (type) {
@@ -448,29 +414,30 @@ const char* GetTraceEventTypeName(const RocmTracerEventType& type) {
   }
 }
 
-void AnnotationMap::Add(uint32 correlation_id, const std::string& annotation) {
-  if (annotation.empty()) return;
-  VLOG(3) << "Add annotation: "
-          << " correlation_id: " << correlation_id
-          << " annotation: " << annotation;
-  absl::MutexLock lock(&map_.mutex);
-  if (map_.annotations.size() < max_size_) {
-    absl::string_view annotation_str =
-        *map_.annotations.insert(annotation).first;
-    map_.correlation_map.emplace(correlation_id, annotation_str);
-  }
-}
+// void AnnotationMap::Add(uint32 correlation_id, const std::string& annotation)
+// {
+//   if (annotation.empty()) return;
+//   VLOG(3) << "Add annotation: "
+//           << " correlation_id: " << correlation_id
+//           << " annotation: " << annotation;
+//   absl::MutexLock lock(&map_.mutex);
+//   if (map_.annotations.size() < max_size_) {
+//     absl::string_view annotation_str =
+//         *map_.annotations.insert(annotation).first;
+//     map_.correlation_map.emplace(correlation_id, annotation_str);
+//   }
+// }
 
-absl::string_view AnnotationMap::LookUp(uint32 correlation_id) {
-  absl::MutexLock lock(&map_.mutex);
-  auto it = map_.correlation_map.find(correlation_id);
-  return it != map_.correlation_map.end() ? it->second : absl::string_view();
-}
+// absl::string_view AnnotationMap::LookUp(uint32 correlation_id) {
+//   absl::MutexLock lock(&map_.mutex);
+//   auto it = map_.correlation_map.find(correlation_id);
+//   return it != map_.correlation_map.end() ? it->second : absl::string_view();
+// }
 
-/* static */ RocmTracer* RocmTracer::GetRocmTracerSingleton() {
-  static auto* singleton = new RocmTracer();
-  return singleton;
-}
+// /* static */ RocmTracer* RocmTracer::GetRocmTracerSingleton() {
+//   static auto* singleton = new RocmTracer();
+//   return singleton;
+// }
 
 bool RocmTracer::IsAvailable() const {
   return !activity_tracing_enabled_ && !api_tracing_enabled_;
@@ -491,45 +458,56 @@ int RocmTracer::NumGpus() {
   return num_gpus;
 }
 
-void RocmTracer::Enable(const RocmTracerOptions& option,
+void RocmTracer::Enable(const RocmTracerOptions& options,
                         RocmTraceCollector* collector) {
-  option_ = option;
+  options_ = options;
   collector_ = collector;
-  annotation_map_.emplace(option.max_annotation_strings);
-
-  roctracer_api_hook_.reset(
-      new RocmApiHookImpl(option, collector, &*annotation_map_));
-
+  api_cb_impl_ = new RocmApiCallbackImpl(options, collector);
+  activity_cb_impl_ = new RocmActivityCallbackImpl(options, collector);
   EnableApiTracing().IgnoreError();
-  if (option_->enable_activity_api) {
+  if (options_->enable_activity_api) {
     EnableActivityTracing().IgnoreError();
   }
 }
 
 void RocmTracer::Disable() {
   DisableApiTracing().IgnoreError();
-  if (option_->enable_activity_api) {
+  if (options_->enable_activity_api) {
     DisableActivityTracing().IgnoreError();
   }
-  Finalize().IgnoreError();
-  roctracer_api_hook_->Flush().IgnoreError();
+  delete api_cb_impl_;
+  delete activity_cb_impl_;
   collector_->Flush();
   collector_ = nullptr;
-  option_.reset();
-  roctracer_api_hook_.reset();
-  annotation_map_.reset();
+  options_.reset();
+}
+
+void ApiCallback(uint32_t domain, uint32_t cbid, const void* cbdata,
+                 void* user_data) {
+  RocmTracer* tracer = reinterpret_cast<RocmTracer*>(user_data);
+  tracer->ApiCallbackHandler(domain, cbid, cbdata);
+}
+
+void RocmTracer::ApiCallbackHandler(uint32_t domain, uint32_t cbid,
+                                    const void* cbdata) {
+  if (api_tracing_enabled_) (*api_cb_impl_)(domain, cbid, cbdata);
 }
 
 Status RocmTracer::EnableApiTracing() {
   if (api_tracing_enabled_) return Status::OK();
   api_tracing_enabled_ = true;
 
-  if (!option_->cbids_selected.empty()) {
-    for (auto cbid : option_->cbids_selected) {
+  if (!options_->cbids_selected.empty()) {
+    VLOG(1) << "Enabling API tracing for " << options_->cbids_selected.size()
+            << " APIs";
+
+    for (auto cbid : options_->cbids_selected) {
+      VLOG(1) << "Enabling API tracing for: " << cbid;
       RETURN_IF_ROCTRACER_ERROR(roctracer_enable_op_callback(
           ACTIVITY_DOMAIN_HIP_API, cbid, ApiCallback, this));
     }
-  } else {  // select all callback ids.
+  } else {  // Register callback for all CBIDs
+    VLOG(1) << "Enabling API tracing for all APIs";
     RETURN_IF_ROCTRACER_ERROR(roctracer_enable_callback(ApiCallback, this));
   }
   return Status::OK();
@@ -537,66 +515,77 @@ Status RocmTracer::EnableApiTracing() {
 
 Status RocmTracer::DisableApiTracing() {
   if (!api_tracing_enabled_) return Status::OK();
-
   api_tracing_enabled_ = false;
 
-  if (!option_->cbids_selected.empty()) {
-    for (auto cbid : option_->cbids_selected) {
+  if (!options_->cbids_selected.empty()) {
+    VLOG(1) << "Disabling API tracing for " << options_->cbids_selected.size()
+            << " APIs";
+
+    for (auto cbid : options_->cbids_selected) {
+      VLOG(1) << "Disabling API tracing for: " << cbid;
       RETURN_IF_ROCTRACER_ERROR(
           roctracer_disable_op_callback(ACTIVITY_DOMAIN_HIP_API, cbid));
     }
   } else {
+    VLOG(1) << "Disabling API tracing for all APIs";
     RETURN_IF_ROCTRACER_ERROR(roctracer_disable_callback());
   }
-
   return Status::OK();
 }
 
-Status RocmTracer::EnableActivityTracing() {
-  if (!option_->activities_selected.empty()) {
-    // Initialize callback functions for Rocm Activity API.
-    VLOG(1) << "Registering roctracer activity callbacks";
+void ActivityCallback(const char* begin, const char* end, void* user_data) {
+  RocmTracer* tracer = reinterpret_cast<RocmTracer*>(user_data);
+  tracer->ActivityCallbackHandler(begin, end);
+}
 
+void RocmTracer::ActivityCallbackHandler(const char* begin, const char* end) {
+  if (activity_tracing_enabled_) (*activity_cb_impl_)(begin, end);
+}
+
+Status RocmTracer::EnableActivityTracing() {
+  if (activity_tracing_enabled_) return Status::OK();
+  activity_tracing_enabled_ = true;
+
+  if (!options_->activities_selected.empty()) {
     // Creating tracer pool.
-    roctracer_properties_t properties{};
-    properties.buffer_size = 0x1000;
-    properties.buffer_callback_fun = ActivityCallback;
-    properties.buffer_callback_arg = this;
-    if (roctracer_default_pool() == NULL)
+    if (roctracer_default_pool() == NULL) {
+      roctracer_properties_t properties{};
+      properties.buffer_size = 0x1000;
+      properties.buffer_callback_fun = ActivityCallback;
+      properties.buffer_callback_arg = this;
       RETURN_IF_ROCTRACER_ERROR(roctracer_open_pool(&properties));
+    }
 
     VLOG(1) << "Enabling activity tracing for "
-            << option_->activities_selected.size() << " activities";
+            << options_->activities_selected.size() << " activities";
 
-    for (auto activity : option_->activities_selected) {
+    for (auto activity : options_->activities_selected) {
       VLOG(1) << "Enabling activity tracing for: " << activity;
       RETURN_IF_ROCTRACER_ERROR(roctracer_enable_domain_activity(activity));
     }
-    // RETURN_IF_ROCTRACER_ERROR(roctracer_enable_activity());
   }
-  activity_tracing_enabled_ = true;
   return Status::OK();
 }
 
 Status RocmTracer::DisableActivityTracing() {
-  if (activity_tracing_enabled_) {
+  if (!activity_tracing_enabled_) return Status::OK();
+  activity_tracing_enabled_ = false;
+
+  if (!options_->activities_selected.empty()) {
     VLOG(1) << "Disabling activity tracing for "
-            << option_->activities_selected.size() << " activities";
-    for (auto activity : option_->activities_selected) {
+            << options_->activities_selected.size() << " activities";
+
+    for (auto activity : options_->activities_selected) {
       VLOG(1) << "Disabling activity tracing for: " << activity;
       RETURN_IF_ROCTRACER_ERROR(roctracer_disable_domain_activity(activity));
     }
-    // RETURN_IF_ROCTRACER_ERROR(roctracer_disable_activity());
-    option_->activities_selected.clear();
+    options_->activities_selected.clear();
 
     VLOG(1) << "Flushing roctracer activity buffer";
     RETURN_IF_ROCTRACER_ERROR(roctracer_flush_activity());
   }
-  activity_tracing_enabled_ = false;
   return Status::OK();
 }
-
-Status RocmTracer::Finalize() { return Status::OK(); }
 
 /*static*/ uint64 RocmTracer::GetTimestamp() {
   uint64_t ts;
@@ -605,96 +594,6 @@ Status RocmTracer::Finalize() { return Status::OK(); }
   }
   // Return 0 on error.
   return 0;
-}
-
-Status RocmTracer::HandleCallback(uint32_t domain, uint32_t cbid,
-                                  const void* cbdata) {
-  if (!api_tracing_enabled_) return Status::OK();  // already unsubscribed.
-  if (domain != ACTIVITY_DOMAIN_HIP_API) return Status::OK();
-
-  const hip_api_data_t* data = reinterpret_cast<const hip_api_data_t*>(cbdata);
-
-  const char* name = roctracer_op_string(domain, cbid, 0);
-  VLOG(3) << "HIP API: " << name;
-  VLOG(3) << "domain: " << domain << " op: " << cbid
-          << " correlation_id: " << data->correlation_id;
-
-  if (data->phase == ACTIVITY_API_PHASE_ENTER) {
-    TF_RETURN_IF_ERROR(roctracer_api_hook_->OnApiEnter(domain, cbid, cbdata));
-  } else if (data->phase == ACTIVITY_API_PHASE_EXIT) {
-    // Set up the map from correlation id to annotation string.
-    const std::string& annotation = tensorflow::Annotation::CurrentAnnotation();
-    if (!annotation.empty()) {
-      annotation_map_->Add(data->correlation_id, annotation);
-    }
-
-    TF_RETURN_IF_ERROR(roctracer_api_hook_->OnApiExit(domain, cbid, cbdata));
-  }
-  return Status::OK();
-}
-
-Status RocmTracer::ProcessActivityRecord(const char* begin, const char* end) {
-  if (!activity_tracing_enabled_) {
-    LOG(WARNING) << "roctracer activity buffer is freed after flush.";
-    return Status::OK();
-  }
-
-  const roctracer_record_t* record =
-      reinterpret_cast<const roctracer_record_t*>(begin);
-  const roctracer_record_t* end_record =
-      reinterpret_cast<const roctracer_record_t*>(end);
-  while (record < end_record) {
-    const char* name =
-        roctracer_op_string(record->domain, record->op, record->kind);
-    VLOG(3) << "activity: " << name;
-    VLOG(3) << "domain: " << record->domain << " op: " << record->op
-            << " correlation_id: " << record->correlation_id
-            << " begin_ns: " << record->begin_ns
-            << " end_ns: " << record->end_ns;
-
-    switch (record->domain) {
-      // HIP API activities.
-      case ACTIVITY_DOMAIN_HIP_API:
-        switch (record->op) {
-          case HIP_API_ID_hipModuleLaunchKernel:
-            AddHipKernelActivityEvent(collector_, &*annotation_map_, record);
-            break;
-
-          case HIP_API_ID_hipMemcpyDtoH:
-          case HIP_API_ID_hipMemcpyHtoD:
-          case HIP_API_ID_hipMemcpyDtoD:
-          case HIP_API_ID_hipMemcpyDtoHAsync:
-          case HIP_API_ID_hipMemcpyHtoDAsync:
-          case HIP_API_ID_hipMemcpyDtoDAsync:
-            AddHipMemcpyActivityEvent(collector_, &*annotation_map_, record);
-            break;
-          default:
-            break;
-        }  // switch (record->op).
-        break;
-
-      // HCC ops activities.
-      case ACTIVITY_DOMAIN_HCC_OPS:
-        switch (record->op) {
-          case 0:  // dispatch
-            AddHccKernelActivityEvent(collector_, &*annotation_map_, record);
-            break;
-          case 1:  // copy
-            AddHccMemcpyActivityEvent(collector_, &*annotation_map_, record);
-            break;
-          // ROCM TODO: decide whther to log these activities later.
-          // case 2: // barrier / marker
-          //  break;
-          default:
-            break;
-        }  // switch (record->op).
-        break;
-    }
-
-    RETURN_IF_ROCTRACER_ERROR(static_cast<roctracer_status_t>(
-        roctracer_next_record(record, &record)));
-  }
-  return Status::OK();
 }
 
 }  // namespace profiler

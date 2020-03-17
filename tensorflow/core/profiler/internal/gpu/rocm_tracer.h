@@ -1,4 +1,4 @@
-/* Copyright 2019 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2020 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,15 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_set.h"
 #include "absl/types/optional.h"
+#include "roctracer/roctracer.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/types.h"
+
+#define USE_PROF_API 1
+#include "hip/hip_runtime.h"
+#undef USE_PROF_API
 
 namespace tensorflow {
 namespace profiler {
@@ -117,15 +122,15 @@ struct RocmTracerOptions {
   bool enable_activity_api;
 
   bool required_callback_api_events;
-  // The callback ids that will be enabled and monitored, if empty, all
-  // Callback ids to be enabled using Callback API.
+  // The callback ids that will be enabled and monitored.
+  // If empty, all Callback ids to be enabled using Callback API.
   std::vector<uint32_t> cbids_selected;
-  // Activity kinds to be collected using Activity API. If empty, the Activity
-  // API is disable.
+  // Activity kinds to be collected using Activity API.
+  // If empty, the Activity API is disabled.
   std::vector<activity_domain_t> activities_selected;
 };
 
-struct RocmTracerCollectorOptions {
+struct RocmTraceCollectorOptions {
   // Maximum number of events to collect from callback API; if -1, no limit.
   // if 0, the callback API is enabled to build a correlation map, but no
   // events are collected.
@@ -164,7 +169,7 @@ class AnnotationMap {
 
 class RocmTraceCollector {
  public:
-  explicit RocmTraceCollector(const RocmTracerCollectorOptions& options)
+  explicit RocmTraceCollector(const RocmTraceCollectorOptions& options)
       : options_(options),
         annotation_map_(options.max_annotation_strings, options.num_gpus) {}
   virtual ~RocmTraceCollector() {}
@@ -175,7 +180,7 @@ class RocmTraceCollector {
   virtual void Flush() = 0;
 
  protected:
-  RocmTracerCollectorOptions options_;
+  RocmTraceCollectorOptions options_;
 
  private:
   AnnotationMap annotation_map_;
@@ -183,21 +188,9 @@ class RocmTraceCollector {
   TF_DISALLOW_COPY_AND_ASSIGN(RocmTraceCollector);
 };
 
-class RocmApiHook {
- public:
-  virtual ~RocmApiHook() {}
-
-  virtual Status OnApiEnter(uint32_t domain, uint32_t cbid,
-                            const void* callback_info) = 0;
-  virtual Status OnApiExit(uint32_t domain, uint32_t cbid,
-                           const void* callback_info) = 0;
-  virtual Status Flush() = 0;
-
- protected:
-  static Status AddApiCallbackEvent(RocmTraceCollector* collector,
-                                    uint32_t domain, uint32_t cbid,
-                                    const void* callback_info);
-};
+// forward declarations for callback functors
+class RocmApiCallbackImpl;
+class RocmActivityCallbackImpl;
 
 // The class use to enable cupti callback/activity API and forward the collected
 // trace events to RocmTraceCollector. There should be only one RocmTracer
@@ -210,14 +203,11 @@ class RocmTracer {
   // Only one profile session can be live in the same time.
   bool IsAvailable() const;
 
-  void Enable(const RocmTracerOptions& option, RocmTraceCollector* collector);
+  void Enable(const RocmTracerOptions& options, RocmTraceCollector* collector);
   void Disable();
 
-  Status HandleCallback(uint32_t domain, uint32_t cbid,
-                        const void* callback_info);
-
-  // This function is public because called from registered callback.
-  Status ProcessActivityRecord(const char* begin, const char* end);
+  void ApiCallbackHandler(uint32_t domain, uint32_t cbid, const void* cbdata);
+  void ActivityCallbackHandler(const char* begin, const char* end);
 
   static uint64 GetTimestamp();
   static int NumGpus();
@@ -233,16 +223,15 @@ class RocmTracer {
   Status EnableActivityTracing();
   Status DisableActivityTracing();
 
-  Status Finalize();
-
   int num_gpus_;
-  absl::optional<RocmTracerOptions> option_;
+  absl::optional<RocmTracerOptions> options_;
   RocmTraceCollector* collector_ = nullptr;
 
   bool api_tracing_enabled_ = false;
   bool activity_tracing_enabled_ = false;
 
-  std::unique_ptr<RocmApiHook> roctracer_api_hook_;
+  RocmApiCallbackImpl* api_cb_impl_;
+  RocmActivityCallbackImpl* activity_cb_impl_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(RocmTracer);
 };

@@ -131,8 +131,8 @@ tf_cuda_library(
 
 tf_cuda_library(
     name = "rocm_tracer",
-    srcs = if_cuda_is_configured_compat(["rocm_tracer.cc"]),
-    hdrs = if_cuda_is_configured_compat(["rocm_tracer.h"]),
+    srcs = if_rocm_is_configured_compat(["rocm_tracer.cc"]),
+    hdrs = if_rocm_is_configured_compat(["rocm_tracer.h"]),
     copts = tf_copts(),
     visibility = ["//visibility:public"],
     deps = [

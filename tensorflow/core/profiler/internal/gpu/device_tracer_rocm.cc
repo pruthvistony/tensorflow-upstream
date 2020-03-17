@@ -26,8 +26,6 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
-#include "hip/hip_runtime.h"
-#include "roctracer/roctracer.h"
 #include "tensorflow/core/framework/step_stats.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/platform/abi.h"
@@ -48,13 +46,13 @@ namespace profiler {
 class RocmTraceCollectorImpl : public profiler::RocmTraceCollector {
  public:
   RocmTraceCollectorImpl(const RocmTraceCollectorOptions& options,
-                         uint64 start_walltime_ns, start_gputime_ns)
+                         uint64 start_walltime_ns, uint64 start_gputime_ns)
       : RocmTraceCollector(options),
         num_callback_events_(0),
         num_activity_events_(0),
         start_walltime_ns_(start_walltime_ns),
-        start_gputime_ns_(start_gputime_ns),
-        per_device_collector_(options.num_gpus) {}
+        start_gputime_ns_(start_gputime_ns) {}
+  // todoo per_device_collector_(options.num_gpus) {}
 
   void AddEvent(RocmTracerEvent&& event) override {
     mutex_lock lock(aggregated_events_mutex_);
@@ -78,29 +76,33 @@ class RocmTraceCollectorImpl : public profiler::RocmTraceCollector {
 
     auto iter = aggregated_events_.find(event.correlation_id);
     if (iter != aggregated_events_.end()) {
-      // event with this correlation id already present
-      // agrregate this event with the existing one
-      switch (event.domain) {
-        case RocmTracerEventDomain::HIP:
-          switch (event.source) {
-            case RocmEventSource::ApiCallback:
-              break;
-            case RocmEventSource::Activity:
-              break;
-          }
-          break;
-        case RocmTracerEventDomain::HCC:
-          switch (event.source) {
-            case RocmEventSource::ApiCallback:
-              break;
-            case RocmEventSource::Activity:
-              break;
-          }
-          break;
-      }
-
+      // // event with this correlation id already present
+      // // agrregate this event with the existing one
+      // switch (event.domain) {
+      //   case RocmTracerEventDomain::HIP:
+      //     switch (event.source) {
+      //       case RocmEventSource::ApiCallback:
+      //         break;
+      //       case RocmEventSource::Activity:
+      // 	      iter->second.annotation = event.annotation;
+      //         break;
+      //     }
+      //     break;
+      //   case RocmTracerEventDomain::HCC:
+      //     switch (event.source) {
+      //       case RocmEventSource::ApiCallback:
+      //         break;
+      //       case RocmEventSource::Activity:
+      // 	      iter->second.device_id = event.device_id;
+      // 	      iter->second.stream_id = event.stream_id;
+      // 	      iter->second.start_time_ns = event.start_time_ns;
+      // 	      iter->second.end_time_ns = event.end_time_ns;
+      //         break;
+      //     }
+      //     break;
+      // }
     } else {
-      aggregated_events.emplace(event.correlation_id, std::move(event));
+      aggregated_events_.emplace(event.correlation_id, std::move(event));
     }
   }
 
@@ -108,6 +110,12 @@ class RocmTraceCollectorImpl : public profiler::RocmTraceCollector {
     VLOG(1) << "RocmTracerEvent(s) dropped (" << num_events << ") : " << reason
             << ".";
   }
+
+  void Flush() override {}
+
+  void Export(StepStats* step_stats) {}
+
+  void Export(XSpace* space) {}
 
  private:
   std::atomic<int> num_callback_events_;
@@ -119,19 +127,20 @@ class RocmTraceCollectorImpl : public profiler::RocmTraceCollector {
   absl::flat_hash_map<uint32, RocmTracerEvent> aggregated_events_
       GUARDED_BY(aggregated_events_mutex_);
 
-  struct PerDeviceCollector {
-    void AddEvent(RocmTracerEvent&& event) {
-      mutex_lock lock(events_mutex);
-      if (event.source == RocmTracerEventSource::ApiCallback) {
-      }
-      events.emplace_back(std::move(event));
-    }
+  // todoo
+  // struct PerDeviceCollector {
+  //   void AddEvent(RocmTracerEvent&& event) {
+  //     mutex_lock lock(events_mutex);
+  //     if (event.source == RocmTracerEventSource::ApiCallback) {
+  //     }
+  //     events.emplace_back(std::move(event));
+  //   }
 
-    mutex events_mutex;
-    std::vector<RocmTracerEvent> events GUARDED_BY(events_mutex);
-  };
+  //   mutex events_mutex;
+  //   std::vector<RocmTracerEvent> events GUARDED_BY(events_mutex);
+  // };
 
-  absl::FixedArray<PerDeviceCollector> per_device_collector_;
+  // absl::FixedArray<PerDeviceCollector> per_device_collector_;
 };
 
 // GpuTracer for ROCm GPU.
@@ -159,7 +168,7 @@ class GpuTracer : public profiler::ProfilerInterface {
 
   RocmTracerOptions GetRocmTracerOptions();
 
-  RocmTraceCollectorrOptions GetRocmTraceCollectorOptions();
+  RocmTraceCollectorOptions GetRocmTraceCollectorOptions(uint32 num_gpus);
 
   enum State {
     kNotStarted,
@@ -171,7 +180,7 @@ class GpuTracer : public profiler::ProfilerInterface {
   State profiling_state_ = State::kNotStarted;
 
   RocmTracer* rocm_tracer_;
-  std::unique_ptr<RocmTracerCollectorImpl> rocm_trace_collector_;
+  std::unique_ptr<RocmTraceCollectorImpl> rocm_trace_collector_;
 };
 
 RocmTracerOptions GetRocmTracerOptions() {
@@ -188,6 +197,9 @@ RocmTracerOptions GetRocmTracerOptions() {
       HIP_API_ID_hipMemcpyHtoDAsync,
       HIP_API_ID_hipMemcpyDtoD,
       HIP_API_ID_hipMemcpyDtoDAsync,
+      // MALLOC / FREE
+      HIP_API_ID_hipMalloc,
+      HIP_API_ID_hipFree,
       // GENERIC
       HIP_API_ID_hipStreamSynchronize,
   };
@@ -199,12 +211,12 @@ RocmTracerOptions GetRocmTracerOptions() {
   return options;
 }
 
-RocmTraceCollectorOptions GetRocmTraceCollectorOptions() {
+RocmTraceCollectorOptions GetRocmTraceCollectorOptions(uint32 num_gpus) {
   RocmTraceCollectorOptions options;
   options.max_callback_api_events = 2 * 1024 * 1024;
   options.max_activity_api_events = 2 * 1024 * 1024;
   options.max_annotation_strings = 1024 * 1024;
-  options.num_gpus = rocm_tracer_->NumGpus();
+  options.num_gpus = num_gpus;
   return options;
 }
 
@@ -216,14 +228,14 @@ Status GpuTracer::DoStart() {
   AnnotationStack::Enable(true);
 
   RocmTraceCollectorOptions trace_collector_options =
-      GetRocmTraceCollectorOptions();
-  uint64 start_gputime_ns = RocmTracer::GetTimestamp();
+      GetRocmTraceCollectorOptions(rocm_tracer_->NumGpus());
   uint64 start_walltime_ns = tensorflow::EnvTime::NowNanos();
-  rocm_tracer_collector_ =
-      absl::make_unique<RocmTraceCollectorImpl>(trace_collector_options);
+  uint64 start_gputime_ns = RocmTracer::GetTimestamp();
+  rocm_trace_collector_ = std::make_unique<RocmTraceCollectorImpl>(
+      trace_collector_options, start_walltime_ns, start_gputime_ns);
 
   RocmTracerOptions tracer_options = GetRocmTracerOptions();
-  rocm_tracer_->Enable(tracer_options, rocm_trace_collector_->get());
+  rocm_tracer_->Enable(tracer_options, rocm_trace_collector_.get());
 
   return Status::OK();
 }
@@ -274,7 +286,7 @@ Status GpuTracer::CollectData(RunMetadata* run_metadata) {
     case State::kStoppedOk: {
       // Input run_metadata is shared by profiler interfaces, we need append.
       StepStats step_stats;
-      DoCollectData(&step_stats;
+      DoCollectData(&step_stats);
       for (auto& dev_stats : *step_stats.mutable_dev_stats()) {
         run_metadata->mutable_step_stats()->add_dev_stats()->Swap(&dev_stats);
       }
