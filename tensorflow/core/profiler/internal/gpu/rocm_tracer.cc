@@ -62,9 +62,9 @@ class RocmApiCallbackImpl {
         reinterpret_cast<const hip_api_data_t*>(cbdata);
 
     const char* name = roctracer_op_string(domain, cbid, 0);
-    VLOG(3) << "HIP API: " << name;
-    VLOG(3) << "domain: " << domain << " op: " << cbid
-            << " correlation_id: " << data->correlation_id;
+    VLOG(-1) << "HIP API: " << name;
+    VLOG(-1) << "domain: " << domain << " op: " << cbid
+             << " correlation_id: " << data->correlation_id;
 
     if (data->phase == ACTIVITY_API_PHASE_ENTER) {
       // Nothing to do here
@@ -121,7 +121,7 @@ class RocmApiCallbackImpl {
     event.kernel_info.grid_y = data->args.hipModuleLaunchKernel.gridDimY;
     event.kernel_info.grid_z = data->args.hipModuleLaunchKernel.gridDimZ;
 
-    VLOG(3) << "HIP Kernel Launched: " << event.name;
+    VLOG(-1) << "HIP Kernel Launched: " << event.name;
     collector_->AddEvent(std::move(event));
   }
 
@@ -170,7 +170,7 @@ class RocmApiCallbackImpl {
         LOG(ERROR) << "Unsupported memcpy activity observed: " << cbid;
         break;
     }
-    VLOG(3) << "HIP Memcpy observed :" << event.memcpy_info.num_bytes;
+    VLOG(-1) << "HIP Memcpy observed :" << event.memcpy_info.num_bytes;
     collector_->AddEvent(std::move(event));
   }
 
@@ -185,11 +185,11 @@ class RocmApiCallbackImpl {
 
     switch (cbid) {
       case HIP_API_ID_hipMalloc:
-        VLOG(3) << "HIP Malloc observed: " << data->args.hipMalloc.size;
+        VLOG(-1) << "HIP Malloc observed: " << data->args.hipMalloc.size;
         event.memalloc_info.num_bytes = data->args.hipMalloc.size;
         break;
       case HIP_API_ID_hipFree:
-        VLOG(3) << "HIP Free observed";
+        VLOG(-1) << "HIP Free observed";
         event.memalloc_info.num_bytes = 0;
         break;
     }
@@ -227,11 +227,11 @@ class RocmActivityCallbackImpl {
     while (record < end_record) {
       const char* name =
           roctracer_op_string(record->domain, record->op, record->kind);
-      VLOG(3) << "activity: " << name;
-      VLOG(3) << "domain: " << record->domain << " op: " << record->op
-              << " correlation_id: " << record->correlation_id
-              << " begin_ns: " << record->begin_ns
-              << " end_ns: " << record->end_ns;
+      VLOG(-1) << "activity: " << name;
+      VLOG(-1) << "domain: " << record->domain << " op: " << record->op
+               << " correlation_id: " << record->correlation_id
+               << " begin_ns: " << record->begin_ns
+               << " end_ns: " << record->end_ns;
 
       switch (record->domain) {
         // HIP API activities.
@@ -417,7 +417,7 @@ const char* GetTraceEventTypeName(const RocmTracerEventType& type) {
 // void AnnotationMap::Add(uint32 correlation_id, const std::string& annotation)
 // {
 //   if (annotation.empty()) return;
-//   VLOG(3) << "Add annotation: "
+//   VLOG(-1) << "Add annotation: "
 //           << " correlation_id: " << correlation_id
 //           << " annotation: " << annotation;
 //   absl::MutexLock lock(&map_.mutex);
@@ -434,10 +434,10 @@ const char* GetTraceEventTypeName(const RocmTracerEventType& type) {
 //   return it != map_.correlation_map.end() ? it->second : absl::string_view();
 // }
 
-// /* static */ RocmTracer* RocmTracer::GetRocmTracerSingleton() {
-//   static auto* singleton = new RocmTracer();
-//   return singleton;
-// }
+/* static */ RocmTracer* RocmTracer::GetRocmTracerSingleton() {
+  static auto* singleton = new RocmTracer();
+  return singleton;
+}
 
 bool RocmTracer::IsAvailable() const {
   return !activity_tracing_enabled_ && !api_tracing_enabled_;
@@ -498,16 +498,16 @@ Status RocmTracer::EnableApiTracing() {
   api_tracing_enabled_ = true;
 
   if (!options_->cbids_selected.empty()) {
-    VLOG(1) << "Enabling API tracing for " << options_->cbids_selected.size()
-            << " APIs";
+    VLOG(-1) << "Enabling API tracing for " << options_->cbids_selected.size()
+             << " APIs";
 
     for (auto cbid : options_->cbids_selected) {
-      VLOG(1) << "Enabling API tracing for: " << cbid;
+      VLOG(-1) << "Enabling API tracing for: " << cbid;
       RETURN_IF_ROCTRACER_ERROR(roctracer_enable_op_callback(
           ACTIVITY_DOMAIN_HIP_API, cbid, ApiCallback, this));
     }
   } else {  // Register callback for all CBIDs
-    VLOG(1) << "Enabling API tracing for all APIs";
+    VLOG(-1) << "Enabling API tracing for all APIs";
     RETURN_IF_ROCTRACER_ERROR(roctracer_enable_callback(ApiCallback, this));
   }
   return Status::OK();
@@ -518,16 +518,16 @@ Status RocmTracer::DisableApiTracing() {
   api_tracing_enabled_ = false;
 
   if (!options_->cbids_selected.empty()) {
-    VLOG(1) << "Disabling API tracing for " << options_->cbids_selected.size()
-            << " APIs";
+    VLOG(-1) << "Disabling API tracing for " << options_->cbids_selected.size()
+             << " APIs";
 
     for (auto cbid : options_->cbids_selected) {
-      VLOG(1) << "Disabling API tracing for: " << cbid;
+      VLOG(-1) << "Disabling API tracing for: " << cbid;
       RETURN_IF_ROCTRACER_ERROR(
           roctracer_disable_op_callback(ACTIVITY_DOMAIN_HIP_API, cbid));
     }
   } else {
-    VLOG(1) << "Disabling API tracing for all APIs";
+    VLOG(-1) << "Disabling API tracing for all APIs";
     RETURN_IF_ROCTRACER_ERROR(roctracer_disable_callback());
   }
   return Status::OK();
@@ -556,11 +556,11 @@ Status RocmTracer::EnableActivityTracing() {
       RETURN_IF_ROCTRACER_ERROR(roctracer_open_pool(&properties));
     }
 
-    VLOG(1) << "Enabling activity tracing for "
-            << options_->activities_selected.size() << " activities";
+    VLOG(-1) << "Enabling activity tracing for "
+             << options_->activities_selected.size() << " activities";
 
     for (auto activity : options_->activities_selected) {
-      VLOG(1) << "Enabling activity tracing for: " << activity;
+      VLOG(-1) << "Enabling activity tracing for: " << activity;
       RETURN_IF_ROCTRACER_ERROR(roctracer_enable_domain_activity(activity));
     }
   }
@@ -572,16 +572,16 @@ Status RocmTracer::DisableActivityTracing() {
   activity_tracing_enabled_ = false;
 
   if (!options_->activities_selected.empty()) {
-    VLOG(1) << "Disabling activity tracing for "
-            << options_->activities_selected.size() << " activities";
+    VLOG(-1) << "Disabling activity tracing for "
+             << options_->activities_selected.size() << " activities";
 
     for (auto activity : options_->activities_selected) {
-      VLOG(1) << "Disabling activity tracing for: " << activity;
+      VLOG(-1) << "Disabling activity tracing for: " << activity;
       RETURN_IF_ROCTRACER_ERROR(roctracer_disable_domain_activity(activity));
     }
     options_->activities_selected.clear();
 
-    VLOG(1) << "Flushing roctracer activity buffer";
+    VLOG(-1) << "Flushing roctracer activity buffer";
     RETURN_IF_ROCTRACER_ERROR(roctracer_flush_activity());
   }
   return Status::OK();

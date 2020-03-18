@@ -143,7 +143,9 @@ tf_cuda_library(
         "@com_google_absl//absl/container:node_hash_map",
         "@com_google_absl//absl/container:node_hash_set",
         "@com_google_absl//absl/types:optional",
-    ],
+    ] + if_rocm_is_configured_compat([
+        "@local_config_rocm//rocm:roctracer",
+    ]),
 )
 
 tf_cuda_library(

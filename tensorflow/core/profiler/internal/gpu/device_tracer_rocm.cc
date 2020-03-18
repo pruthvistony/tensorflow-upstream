@@ -107,8 +107,8 @@ class RocmTraceCollectorImpl : public profiler::RocmTraceCollector {
   }
 
   void OnEventsDropped(const std::string& reason, uint32 num_events) override {
-    VLOG(1) << "RocmTracerEvent(s) dropped (" << num_events << ") : " << reason
-            << ".";
+    VLOG(-1) << "RocmTracerEvent(s) dropped (" << num_events << ") : " << reason
+             << ".";
   }
 
   void Flush() override {}
@@ -147,7 +147,7 @@ class RocmTraceCollectorImpl : public profiler::RocmTraceCollector {
 class GpuTracer : public profiler::ProfilerInterface {
  public:
   GpuTracer(RocmTracer* rocm_tracer) : rocm_tracer_(rocm_tracer) {
-    VLOG(1) << "GpuTracer created.";
+    VLOG(-1) << "GpuTracer created.";
   }
   ~GpuTracer() override {}
 
@@ -183,7 +183,7 @@ class GpuTracer : public profiler::ProfilerInterface {
   std::unique_ptr<RocmTraceCollectorImpl> rocm_trace_collector_;
 };
 
-RocmTracerOptions GetRocmTracerOptions() {
+RocmTracerOptions GpuTracer::GetRocmTracerOptions() {
   RocmTracerOptions options;
   options.enable_activity_api = true;
   options.required_callback_api_events = true;
@@ -211,7 +211,8 @@ RocmTracerOptions GetRocmTracerOptions() {
   return options;
 }
 
-RocmTraceCollectorOptions GetRocmTraceCollectorOptions(uint32 num_gpus) {
+RocmTraceCollectorOptions GpuTracer::GetRocmTraceCollectorOptions(
+    uint32 num_gpus) {
   RocmTraceCollectorOptions options;
   options.max_callback_api_events = 2 * 1024 * 1024;
   options.max_activity_api_events = 2 * 1024 * 1024;
@@ -273,7 +274,7 @@ Status GpuTracer::DoCollectData(StepStats* step_stats) {
 Status GpuTracer::CollectData(RunMetadata* run_metadata) {
   switch (profiling_state_) {
     case State::kNotStarted:
-      VLOG(1) << "No trace data collected, session wasn't started";
+      VLOG(-1) << "No trace data collected, session wasn't started";
       return Status::OK();
     case State::kStartedOk:
       return errors::FailedPrecondition("Cannot collect trace before stopping");
@@ -281,7 +282,7 @@ Status GpuTracer::CollectData(RunMetadata* run_metadata) {
       LOG(ERROR) << "Cannot collect, roctracer failed to start";
       return Status::OK();
     case State::kStoppedError:
-      VLOG(1) << "No trace data collected";
+      VLOG(-1) << "No trace data collected";
       return Status::OK();
     case State::kStoppedOk: {
       // Input run_metadata is shared by profiler interfaces, we need append.
@@ -304,7 +305,7 @@ Status GpuTracer::DoCollectData(XSpace* space) {
 Status GpuTracer::CollectData(XSpace* space) {
   switch (profiling_state_) {
     case State::kNotStarted:
-      VLOG(1) << "No trace data collected, session wasn't started";
+      VLOG(-1) << "No trace data collected, session wasn't started";
       return Status::OK();
     case State::kStartedOk:
       return errors::FailedPrecondition("Cannot collect trace before stopping");
@@ -312,7 +313,7 @@ Status GpuTracer::CollectData(XSpace* space) {
       LOG(ERROR) << "Cannot collect, roctracer failed to start";
       return Status::OK();
     case State::kStoppedError:
-      VLOG(1) << "No trace data collected";
+      VLOG(-1) << "No trace data collected";
       return Status::OK();
     case State::kStoppedOk: {
       DoCollectData(space);
