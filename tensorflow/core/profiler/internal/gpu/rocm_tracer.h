@@ -20,18 +20,16 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_set.h"
 #include "absl/types/optional.h"
-#include "roctracer/roctracer.h"
+#include "roctracer/roctracer_hip.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/types.h"
 
-#define USE_PROF_API 1
-#include "hip/hip_runtime.h"
-#undef USE_PROF_API
-
 namespace tensorflow {
 namespace profiler {
+
+const int kRocmTracerVlog = -1;
 
 struct MemcpyDetails {
   // The amount of data copied for memcpy events.
@@ -76,8 +74,6 @@ enum class RocmTracerEventType {
   MemoryAlloc = 7,
   Generic = 100,
 };
-
-const char* GetTraceEventTypeName(const RocmTracerEventType& type);
 
 enum class RocmTracerEventSource {
   ApiCallback = 0,
